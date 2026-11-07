@@ -1,10 +1,19 @@
 import logging
-import wave, threading, re, time
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import wave
 from pathlib import Path
 import numpy as np, sounddevice as sd
+import emoji
 from .config import load, save, APP_DIR
 log=logging.getLogger("himari.voice")
 _UNSET = object()
+DEFAULT_TTS_VOICES = {"en": "en_US-amy-medium"}
 _MINECRAFT_LAUNCHER_COMMAND = re.compile(
     r"\b(?:please\s+)?(?:open|launch|start)\s*(?:the\s*)?"
     r"(?:minecraft|mine\s*craft|miner\s*craft|mainer\s*craft)\s*launcher\b",
@@ -14,6 +23,51 @@ _MINECRAFT_LAUNCHER_COMMAND = re.compile(
 
 def correct_known_voice_commands(text):
     return _MINECRAFT_LAUNCHER_COMMAND.sub("Open Minecraft Launcher", text)
+
+
+def speech_text(text, language="en"):
+    locale = "ru" if language == "ru" else "en"
+    text = emoji.demojize(text, language=locale)
+    if locale == "en":
+        text = re.sub(
+            r":(?:grinning_face(?:_with_smiling_eyes)?|"
+            r"beaming_face_with_smiling_eyes|smile|slightly_smiling_face|"
+            r"smiling_face_with_smiling_eyes):",
+            " smiling face ",
+            text,
+        )
+    else:
+        text = re.sub(
+            r":(?:улыбается(?:_с_открытым_ртом|_открытым_ртом)?|"
+            r"довольно_улыбается|слегка_улыбается)(?:_тон_кожи_[0-9])?:",
+            " улыбающееся лицо ",
+            text,
+        )
+    text = re.sub(
+        r":([A-Za-zА-Яа-яЁё0-9_+\-]+):",
+        lambda match: match.group(1).replace("_", " "),
+        text,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _spoken_language(text, default="en"):
+    cyrillic = sum(
+        char.isalpha() and "CYRILLIC" in unicodedata.name(char, "")
+        for char in text
+    )
+    latin = sum(char.isalpha() and char.isascii() for char in text)
+    if cyrillic > latin:
+        return "ru"
+    if latin:
+        return "en"
+    return "ru" if str(default).lower().startswith("ru") else "en"
+
+
+def _bundled_voice_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS) / "voices"
+    return Path(__file__).resolve().parents[1] / "models" / "piper-voices"
 
 
 def _cached_stt_model(name):
@@ -220,32 +274,45 @@ class TTS:
         self._play_lock=threading.Lock(); self._synthesis_lock=threading.Lock()
         self._voice=None; self._voice_path=None
         self._on_error=on_error; self._on_finished=on_finished
+        self._windows_process=None
+        self._windows_process_lock=threading.Lock()
 
     def available_voices(self):
-        voices = APP_DIR / "voices"
-        voices.mkdir(parents=True, exist_ok=True)
-        return sorted(p.stem for p in voices.glob("*.onnx"))
+        user_voices = APP_DIR / "voices"
+        user_voices.mkdir(parents=True, exist_ok=True)
+        return sorted({
+            path.stem
+            for directory in (user_voices, _bundled_voice_dir())
+            for path in directory.glob("*.onnx")
+        })
+
+    def _find_voice_file(self, name):
+        for directory in (APP_DIR / "voices", _bundled_voice_dir()):
+            candidate = directory / f"{name}.onnx"
+            if candidate.is_file():
+                return candidate
+        return None
 
     def _resolve_voice_path(self, lang=None):
-        cfg=load()["voice"]
-        voices_dir=APP_DIR/"voices"; voices_dir.mkdir(parents=True, exist_ok=True)
+        cfg = load()["voice"]
+        (APP_DIR / "voices").mkdir(parents=True, exist_ok=True)
         lang_value = (lang or str(cfg.get("recognition_language") or cfg.get("language") or "en")).lower()
         available = self.available_voices()
-        if not available:
-            return None
-        if lang_value.startswith("ru"):
-            preferred = [name for name in available if "ru" in name.lower()]
-        else:
-            preferred = [name for name in available if "en" in name.lower()]
-        if preferred:
-            return voices_dir / f"{preferred[0]}.onnx"
-
         requested = str(cfg.get("tts_voice") or "").strip()
-        if requested:
-            candidate = voices_dir / f"{requested}.onnx"
-            if candidate.exists():
-                return candidate
-        return voices_dir / f"{available[0]}.onnx"
+        if lang_value.startswith("ru"):
+            preferred = [name for name in available if name.lower().startswith("ru_")]
+        else:
+            preferred = [name for name in available if name.lower().startswith("en_")]
+
+        if requested in preferred and not (
+            requested == "en_US-lessac-medium"
+            and DEFAULT_TTS_VOICES["en"] in preferred
+        ):
+            return self._find_voice_file(requested)
+        if preferred:
+            default = DEFAULT_TTS_VOICES.get("en")
+            return self._find_voice_file(default if default in preferred else preferred[0])
+        return None
 
     def speak(self,text):
         self.stop()
@@ -255,27 +322,108 @@ class TTS:
         self._thread.start()
     def _sentences(self,text):
         parts=re.split(r'(?<=[.!?])\s+',text.strip())
-        return [p for p in parts if p.strip()]
+        default = str(load()["voice"].get("recognition_language") or "en")
+        response_language = _spoken_language(text, default)
+        return [
+            (part.strip(), _spoken_language(part, response_language))
+            for part in parts if part.strip()
+        ]
+
+    @staticmethod
+    def _synthesis_config(sentence):
+        from piper.config import SynthesisConfig
+
+        excited = sentence.endswith("!") or bool(re.search(
+            r"\b(?:yay|woo|ура|классно|здорово|супер)\b",
+            sentence,
+            flags=re.IGNORECASE,
+        ))
+        return SynthesisConfig(
+            length_scale=0.90 if excited else 0.96,
+            noise_scale=0.72 if excited else 0.68,
+            noise_w_scale=0.82,
+        )
+
+    @staticmethod
+    def _windows_speech_script(language):
+        language_prefix = "ru" if language == "ru" else "en"
+        return (
+            "$ErrorActionPreference='Stop'; "
+            "Add-Type -AssemblyName System.Speech; "
+            "$stream=[Console]::OpenStandardInput(); "
+            "$memory=New-Object System.IO.MemoryStream; "
+            "$stream.CopyTo($memory); "
+            "$text=[System.Text.Encoding]::UTF8.GetString($memory.ToArray()); "
+            "$synth=New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$voice=$synth.GetInstalledVoices() | Where-Object {{ $_.Enabled -and "
+            f"$_.VoiceInfo.Culture.Name -like '{language_prefix}-*' }} | Select-Object -First 1; "
+            "if (-not $voice) { "
+            "[Console]::Error.WriteLine('No matching Windows speech voice is installed.'); exit 2 }; "
+            "$synth.SelectVoice($voice.VoiceInfo.Name); $synth.Speak($text); $synth.Dispose()"
+        )
+
+    def _speak_with_windows(self, text, language, stop_event):
+        if sys.platform != "win32":
+            raise RuntimeError(f"No bundled {language} Piper voice is available.")
+        executable = shutil.which("powershell.exe")
+        if not executable:
+            raise RuntimeError("Windows PowerShell is required for the installed Windows speech voice.")
+        process = subprocess.Popen(
+            [
+                executable, "-NoLogo", "-NoProfile", "-NonInteractive",
+                "-Command", self._windows_speech_script(language),
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        with self._windows_process_lock:
+            self._windows_process = process
+        try:
+            process.stdin.write(text.encode("utf-8"))
+            process.stdin.close()
+            while process.poll() is None:
+                if stop_event.wait(0.1):
+                    process.terminate()
+                    process.wait()
+                    return
+            error = process.stderr.read().decode("utf-8", errors="replace").strip()
+            if process.returncode:
+                if language == "ru":
+                    raise RuntimeError(
+                        "No Russian Windows speech voice is installed. Add a Russian speech voice in Windows Settings."
+                    )
+                raise RuntimeError(error or "Windows speech synthesis failed.")
+        finally:
+            with self._windows_process_lock:
+                if self._windows_process is process:
+                    self._windows_process = None
+            if process.poll() is None:
+                process.terminate()
+                process.wait()
+
     def _run(self,text,stop_event):
-        cfg=load()["voice"]; voices=APP_DIR/"voices"; voices.mkdir(exist_ok=True)
-        model = self._resolve_voice_path(cfg.get("recognition_language") or cfg.get("language") or "en")
-        if model is None or not model.exists():
-            available = self.available_voices()
-            requested = str(cfg.get("tts_voice") or "").strip()
-            if available:
-                chosen = available[0]
-                cfg["tts_voice"] = chosen
-                save(cfg)
-                model = voices / f"{chosen}.onnx"
-            else:
-                missing = requested or "configured voice"
-                self._report_error(f"Piper voice '{missing}.onnx' not found in {voices}. Download a local English or Russian voice into that folder before speaking.")
-                return
+        APP_DIR.mkdir(parents=True, exist_ok=True)
         wav=APP_DIR/f"tts_out_{threading.get_ident()}.wav"
         failed=False
         try:
-            for sent in self._sentences(text):
+            for sent, language in self._sentences(text):
                 if stop_event.is_set(): return
+                spoken = speech_text(sent, language)
+                if not spoken:
+                    continue
+                model = self._resolve_voice_path(language)
+                if model is None:
+                    if language == "ru":
+                        self._speak_with_windows(spoken, language, stop_event)
+                        continue
+                    cfg = load()["voice"]
+                    requested = str(cfg.get("tts_voice") or DEFAULT_TTS_VOICES["en"])
+                    raise RuntimeError(
+                        f"English Piper voice '{requested}.onnx' is missing. "
+                        "Prepare the bundled voice with setup_windows.bat."
+                    )
                 with self._synthesis_lock:
                     if stop_event.is_set(): return
                     if self._voice is None or self._voice_path != model:
@@ -283,7 +431,11 @@ class TTS:
                         self._voice=PiperVoice.load(model)
                         self._voice_path=model
                     with wave.open(str(wav),"wb") as output:
-                        self._voice.synthesize_wav(sent,output)
+                        self._voice.synthesize_wav(
+                            spoken,
+                            output,
+                            syn_config=self._synthesis_config(sent),
+                        )
                 self._play(str(wav),stop_event)
         except Exception as e:
             failed=True
@@ -327,6 +479,10 @@ class TTS:
                 except Exception: pass
     def stop(self):
         self._stop.set()
+        with self._windows_process_lock:
+            process = self._windows_process
+        if process is not None and process.poll() is None:
+            process.terminate()
         try: sd.stop()
         except Exception: pass
 class Mic:

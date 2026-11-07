@@ -26,6 +26,7 @@ class UI(QMainWindow):
             on_finished=lambda:self.status.emit("Ready."),
         )
         self.mic=Mic(); self.stt=None; self.busy=False; self.hotkey_id=None
+        self._streamed_response = ""
         self.hotkey_error = None
         self.wake_word_monitor = WakeWordMonitor(
             on_detect=self.wake_word_detected_signal.emit,
@@ -121,6 +122,8 @@ class UI(QMainWindow):
         self.cb_store=QCheckBox("Store conversations locally"); self.cb_store.setChecked(load()["privacy"]["store_conversations"])
         self.cb_apps=QCheckBox("Allow opening apps and Steam games"); self.cb_apps.setChecked(load()["permissions"]["allow_open_app"])
         self.cb_web=QCheckBox("Allow opening websites"); self.cb_web.setChecked(load()["permissions"]["allow_open_url"])
+        self.cb_research=QCheckBox("Allow background web research (sends search terms to DuckDuckGo; does not open a browser)")
+        self.cb_research.setChecked(load()["permissions"].get("allow_web_research", True))
         self.cb_cmd=QCheckBox("Allow shell commands (dangerous)"); self.cb_cmd.setChecked(load()["permissions"]["allow_run_command"])
         self.cb_write=QCheckBox("Allow file writes"); self.cb_write.setChecked(load()["permissions"]["allow_write_file"])
         self.cb_wake=QCheckBox("Enable wake-word listening (Himari)"); self.cb_wake.setChecked(load()["voice"].get("wake_word_enabled",False))
@@ -149,8 +152,14 @@ class UI(QMainWindow):
                     if index==selected_device: self.mic_box.setCurrentIndex(self.mic_box.count()-1)
         except Exception as e: log.warning("Microphone list unavailable: %s",e)
         self.voice_box=QComboBox()
-        self.voice_box.addItems(TTS().available_voices() or [load()["voice"].get("tts_voice","en_US-lessac-medium")])
+        available_voices = TTS().available_voices()
         configured_voice = load()["voice"].get("tts_voice")
+        if (
+            configured_voice == "en_US-lessac-medium"
+            and "en_US-amy-medium" in available_voices
+        ):
+            configured_voice = "en_US-amy-medium"
+        self.voice_box.addItems(available_voices or [configured_voice or "en_US-amy-medium"])
         if configured_voice in [self.voice_box.itemText(i) for i in range(self.voice_box.count())]:
             self.voice_box.setCurrentText(configured_voice)
         self.model_box=QComboBox(); self.model_box.addItems(self.llm.list_models() or ["qwen3:8b"])
@@ -168,7 +177,7 @@ class UI(QMainWindow):
         self.wake_word_field=QLineEdit(load()["voice"].get("wake_word","Himari"))
         self.vol=QSlider(Qt.Horizontal); self.vol.setRange(0,100); self.vol.setValue(int(load()["voice"]["volume"]*100))
         self.hotkey=QLineEdit(load()["voice"]["push_to_talk_key"])
-        for w in [self.cb_capture,self.cb_vision,self.cb_store,self.cb_apps,self.cb_web,self.cb_cmd,self.cb_write,self.cb_wake,
+        for w in [self.cb_capture,self.cb_vision,self.cb_store,self.cb_apps,self.cb_web,self.cb_research,self.cb_cmd,self.cb_write,self.cb_wake,
                   self.cb_always_on_top,self.cb_minimize_to_tray,
                   QLabel("Folders available to file tools:"),self.allowed_folders]: sv.addWidget(w)
         sv.addLayout(folder_row)
@@ -176,7 +185,7 @@ class UI(QMainWindow):
                   QLabel("Recognition language:"),self.lang_box,
                   QLabel("Wake word:"),self.wake_word_field,
                   QLabel("Wake-word sensitivity:"),self.sensitivity,
-                  QLabel("Voice:"),self.voice_box,
+                  QLabel("Voice (English default; Russian falls back to Windows):"),self.voice_box,
                   QLabel("Chat model:"),self.model_box,QLabel("Vision model:"),self.vision_box,
                   QLabel("TTS volume:"),self.vol,QLabel("Push-to-talk key:"),self.hotkey]: sv.addWidget(w)
         sv.addStretch(); tabs.addTab(st,"Settings")
@@ -278,6 +287,7 @@ class UI(QMainWindow):
                               for i in range(self.allowed_folders.count())):
             self.allowed_folders.addItem(folder)
     def _token(self,t):
+        self._streamed_response += t
         self._status("Generating response…")
         cursor=self.chat.textCursor()
         cursor.movePosition(QTextCursor.End)
@@ -290,6 +300,10 @@ class UI(QMainWindow):
         self.refresh_actions()
     def _done(self,t):
         self.busy=False
+        if t.strip() and not self._streamed_response.rstrip().endswith(t.strip()):
+            self.chat.append(f"\nHimari: {t}")
+            self._streamed_response = t
+        self.chat.ensureCursorVisible()
         if load()["privacy"].get("store_conversations",True): db.add_message(self.session,"assistant",t)
         if len(db.history(self.session, limit=40)) >= 6 and load()["privacy"].get("auto_memory", True):
             recent = " | ".join(f"{m['role']}: {m['content']}" for m in db.history(self.session, limit=40))
@@ -308,6 +322,7 @@ class UI(QMainWindow):
         text=self.input.text().strip()
         if not text: return
         self.input.clear(); self.busy=True
+        self._streamed_response = ""
         self._status("Hmm, let me think.")
         self.chat.append(f"\nYou: {text}\nHimari: ")
         if load()["privacy"].get("store_conversations",True): db.add_message(self.session,"user",text)
@@ -491,6 +506,7 @@ class UI(QMainWindow):
         cfg["privacy"]["store_conversations"]=self.cb_store.isChecked()
         cfg["permissions"]["allow_open_app"]=self.cb_apps.isChecked()
         cfg["permissions"]["allow_open_url"]=self.cb_web.isChecked()
+        cfg["permissions"]["allow_web_research"]=self.cb_research.isChecked()
         cfg["permissions"]["allow_run_command"]=self.cb_cmd.isChecked()
         cfg["permissions"]["allow_write_file"]=self.cb_write.isChecked()
         cfg["ui"]["always_on_top"]=self.cb_always_on_top.isChecked()
@@ -501,7 +517,7 @@ class UI(QMainWindow):
         cfg["ollama"]["chat_model"]=self.model_box.currentText()
         cfg["ollama"]["vision_model"]=self.vision_box.currentText()
         cfg["voice"]["volume"]=self.vol.value()/100
-        cfg["voice"]["tts_voice"]=self.voice_box.currentText() if self.voice_box.count() else cfg["voice"].get("tts_voice", "en_US-lessac-medium")
+        cfg["voice"]["tts_voice"]=self.voice_box.currentText() if self.voice_box.count() else cfg["voice"].get("tts_voice", "en_US-amy-medium")
         cfg["voice"]["push_to_talk_key"]=self.hotkey.text().strip() or "f9"
         cfg["voice"]["microphone_device"]=self.mic_box.currentData()
         cfg["voice"]["wake_word_enabled"]=self.cb_wake.isChecked()

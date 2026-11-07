@@ -40,6 +40,29 @@ def test_confirmation_required_tools_fail_closed_without_callback():
     assert client.chat.call_count == 2
 
 
+def test_silent_tool_results_are_not_sent_to_the_visible_tool_callback():
+    action = Mock(return_value="Web sources.")
+    client = Mock()
+    client.chat.side_effect = [
+        iter([_chunk(tool_calls=[_tool_call("research_web", {"query": "latest news"})])]),
+        iter([_chunk("Here is a sourced summary.")]),
+    ]
+    llm = LLM([{
+        "name": "research_web",
+        "silent": True,
+        "fn": action,
+        "spec": {},
+    }])
+    visible_tools = []
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.db.log_action"):
+        response = llm.stream_chat([], on_tool=lambda *args: visible_tools.append(args))
+
+    assert response == "Here is a sourced summary."
+    assert visible_tools == []
+    action.assert_called_once_with(query="latest news")
+
+
 def test_tool_rounds_are_bounded():
     action = Mock(return_value="done")
     client = Mock()

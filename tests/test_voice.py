@@ -131,6 +131,7 @@ def test_stt_prefers_bundled_multilingual_model_over_saved_english_model(tmp_pat
 
 def test_tts_reports_missing_voice_without_crashing(tmp_path, monkeypatch):
     monkeypatch.setattr(voice, "APP_DIR", tmp_path)
+    monkeypatch.setattr(voice, "_bundled_voice_dir", lambda: tmp_path / "bundled")
     monkeypatch.setattr(voice, "load", lambda: {
         "voice": {"tts_voice": "missing-voice", "volume": 1.0},
     })
@@ -138,6 +139,84 @@ def test_tts_reports_missing_voice_without_crashing(tmp_path, monkeypatch):
     TTS(on_error=errors.append)._run("Hello.", threading.Event())
     assert len(errors) == 1
     assert "missing-voice.onnx" in errors[0]
+
+
+def test_tts_finds_bundled_amy_voice_and_replaces_legacy_lessac_default(tmp_path, monkeypatch):
+    user_dir = tmp_path / "voices"
+    bundled_dir = tmp_path / "bundled"
+    user_dir.mkdir()
+    bundled_dir.mkdir()
+    (user_dir / "en_US-lessac-medium.onnx").touch()
+    (bundled_dir / "en_US-amy-medium.onnx").touch()
+    monkeypatch.setattr(voice, "APP_DIR", tmp_path)
+    monkeypatch.setattr(voice, "_bundled_voice_dir", lambda: bundled_dir)
+    monkeypatch.setattr(voice, "load", lambda: {
+        "voice": {"tts_voice": "en_US-lessac-medium", "recognition_language": "auto"},
+    })
+
+    tts = TTS()
+
+    assert "en_US-amy-medium" in tts.available_voices()
+    assert tts._resolve_voice_path("en").name == "en_US-amy-medium.onnx"
+
+
+@pytest.mark.parametrize(
+    ("text", "language", "expected"),
+    [
+        ("Hello 😊", "en", "Hello smiling face"),
+        ("Привет 😊", "ru", "Привет улыбающееся лицо"),
+        ("Keep <3", "en", "Keep <3"),
+    ],
+)
+def test_speech_text_demojizes_without_mutating_display_text(text, language, expected):
+    assert voice.speech_text(text, language) == expected
+
+
+def test_tts_routes_each_sentence_to_its_language():
+    tts = TTS()
+
+    assert tts._sentences("Hello there. Привет, Химари! 😊") == [
+        ("Hello there.", "en"),
+        ("Привет, Химари!", "ru"),
+        ("😊", "ru"),
+    ]
+
+
+def test_windows_speech_uses_installed_voice_matching_language():
+    script = TTS._windows_speech_script("ru")
+
+    assert "Culture.Name -like 'ru-*'" in script
+    assert "OpenStandardInput" in script
+
+
+def test_windows_speech_uses_hidden_powershell_process(monkeypatch):
+    process = Mock()
+    process.poll.return_value = 0
+    process.returncode = 0
+    process.stderr.read.return_value = b""
+    popen = Mock(return_value=process)
+    no_window = 0x08000000
+    monkeypatch.setattr(voice, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(voice, "shutil", SimpleNamespace(which=Mock(return_value="powershell.exe")))
+    monkeypatch.setattr(voice, "subprocess", SimpleNamespace(
+        Popen=popen,
+        PIPE=-1,
+        DEVNULL=-3,
+        CREATE_NO_WINDOW=no_window,
+    ))
+
+    TTS()._speak_with_windows("Привет.", "ru", threading.Event())
+
+    assert popen.call_args.kwargs["creationflags"] == no_window
+    assert process.stdin.write.call_args.args[0] == "Привет.".encode("utf-8")
+
+
+def test_tts_synthesis_config_varies_sentence_prosody():
+    calm = TTS._synthesis_config("Hello there.")
+    excited = TTS._synthesis_config("Yay, that's wonderful!")
+
+    assert excited.length_scale < calm.length_scale
+    assert excited.noise_scale > calm.noise_scale
 
 
 def test_stt_prefers_multilingual_local_model(monkeypatch):

@@ -1,11 +1,12 @@
 # Himari 2.0 (ひまり) — Local AI Desktop Companion
 
-Himari is a Windows desktop companion built with PySide6. Chat and inference use a locally running Ollama service; conversation history and memories are stored in a local SQLite database. No hosted AI service or telemetry is used.
+Himari is a Windows desktop companion built with PySide6. Chat and inference use a locally running Ollama service; conversation history and memories are stored in a local SQLite database. It does not use hosted AI APIs or telemetry. Optional, user-requested web research sends focused search terms to DuckDuckGo; it does not send chat history.
 
 ## Current capabilities
 
 - Streaming Ollama chat with Qwen3 and bounded native tool calling.
-- Push-to-talk recording, local faster-whisper transcription, and interruptible Piper speech output.
+- Quiet, source-linked background web research for news and current questions; no browser window is opened.
+- Push-to-talk recording, local faster-whisper transcription, and interruptible English Piper / Windows Russian speech output.
 - Selectable input microphone, F9 push-to-talk, multilingual speech recognition, chat, editable memories, and local history.
 - Opt-in screen capture, Tesseract OCR, and optional vision through a separately installed local Ollama model.
 - Permission-gated app/browser launches, Spotify search, Steam game launch, system volume, and confirmed file access.
@@ -15,12 +16,14 @@ Himari is a Windows desktop companion built with PySide6. Chat and inference use
 ## Requirements and setup
 
 1. Use 64-bit Windows 10/11 and install Python 3.10+, Ollama, and (for OCR) Tesseract.
-2. Run `setup_windows.bat`. It installs Python dependencies. Answer **Yes** when prompted to download the multilingual faster-whisper `large-v3-turbo` model. The model is about 1.62 GB and is bundled into the standalone Windows build. Himari uses it for automatic language detection and better app-name recognition. The script separately asks before downloading a Piper voice.
+2. Run `setup_windows.bat`. It installs Python dependencies. Answer **Yes** when prompted to download the multilingual faster-whisper `large-v3-turbo` model and the feminine English Piper Amy voice. Both are bundled into the standalone Windows build. Himari uses the speech model for automatic language detection and app-name recognition.
 3. Prepare the local chat model yourself with `ollama pull qwen3:8b` while online. Himari does not download Ollama models. Start Ollama before launching.
-4. Run `run_himari.bat`. If the speech model or Piper voice is not prepared, their features report an error rather than downloading a model on first use.
+4. Run `run_himari.bat`. If speech assets are unavailable, their features report an error rather than downloading a model on first use.
 5. To build the Windows application, run `build_windows.bat`. It produces `dist\Himari\Himari.exe`; with Inno Setup 6 installed it also produces `installer\HimariSetup.exe`.
 
-Speech recognition runs locally. Himari prefers its bundled multilingual `large-v3-turbo` model and otherwise uses a compatible model already cached on the machine. The bundled model is under 3 GB and is included in `dist\Himari` when prepared before building. Model weights are not committed to GitHub. If no multilingual model is available, Automatic may fall back to an English-only model, which will not reliably recognize other languages. The optional Piper files belong in `%USERPROFILE%\.himari\voices`; choose an installed English or Russian voice in Settings when available. A local vision-capable Ollama model must be installed and selected separately; the default Qwen chat model is not a vision model. Tesseract is an external install and is not bundled.
+Speech recognition runs locally. Himari prefers its bundled multilingual `large-v3-turbo` model and otherwise uses a compatible model already cached on the machine. The bundled model is under 3 GB and is included in `dist\Himari` when prepared before building. Model weights are not committed to GitHub. If no multilingual model is available, Automatic may fall back to an English-only model, which will not reliably recognize other languages. The standalone build includes the feminine Amy English voice. Russian replies use the installed Russian Windows speech voice (for example, Microsoft Irina); add a Russian speech voice in Windows Settings if one is unavailable. Emoji are expanded into spoken names without changing the displayed conversation. Himari starts speaking only once the final response text is present in the chat. A local vision-capable Ollama model must be installed and selected separately; the default Qwen chat model is not a vision model. Tesseract is an external install and is not bundled.
+
+When you ask for news or current research, Himari can quietly query DuckDuckGo over HTTPS and return a short summary with source links. It searches only when relevant or explicitly requested, does not open Chrome, and does not download pages or add browser automation. Search terms are sent to DuckDuckGo; background research can be disabled in **Settings**. If the search service cannot be reached, Himari reports that it could not verify current information instead of guessing. Normal chat remains local to Ollama.
 
 ## Offline preparation
 
@@ -30,7 +33,7 @@ On an internet-connected Windows machine with the same Python version and archit
 python -m pip download -r requirements.txt -d wheelhouse
 ```
 
-Copy the project and `wheelhouse` to the offline machine, then run `setup_windows.bat`; it uses `pip --no-index`. To prepare a standalone speech-enabled build offline, first run setup on an internet-connected machine and copy the ignored `models\large-v3-turbo` folder with the project. Separately install Ollama and prepare its `qwen3:8b` model, prepare a Piper voice, and install Tesseract if OCR is needed. Ollama model files are not included in the installer. Explicit website/Spotify actions still open external services and require a network.
+Copy the project and `wheelhouse` to the offline machine, then run `setup_windows.bat`; it uses `pip --no-index`. To prepare a standalone speech-enabled build offline, first run setup on an internet-connected machine and copy the ignored `models\large-v3-turbo` and `models\piper-voices` folders with the project. Separately install Ollama and prepare its `qwen3:8b` model, add a Russian Windows speech voice if needed, and install Tesseract if OCR is needed. Ollama model files are not included in the installer. Background web research and explicit website/Spotify actions require an internet connection.
 
 ## Use and privacy
 

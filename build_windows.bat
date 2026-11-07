@@ -10,6 +10,11 @@ if not exist "models\large-v3-turbo\model.bin" (
     echo Run setup_windows.bat and choose Yes to prepare it, then rebuild.
     exit /b 1
 )
+if not exist "models\piper-voices\en_US-amy-medium.onnx" (
+    echo The bundled English Piper voice is missing.
+    echo Run setup_windows.bat and choose Yes to prepare it, then rebuild.
+    exit /b 1
+)
 call ".venv\Scripts\activate.bat"
 if errorlevel 1 exit /b 1
 python -m PyInstaller --noconfirm --clean Himari.spec

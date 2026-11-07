@@ -20,10 +20,10 @@ if errorlevel 2 goto skip_stt
 python prepare_speech_model.py
 if errorlevel 1 echo Speech model download failed. Rerun setup_windows.bat and choose Yes before building the standalone app.
 :skip_stt
-choice /c YN /m "Download the optional Piper en_US-lessac-medium voice now"
+choice /c YN /m "Download and bundle the English feminine Piper en_US-amy-medium voice now"
 if errorlevel 2 goto skip_tts
-python -m piper.download_voices --download-dir "%USERPROFILE%\.himari\voices" en_US-lessac-medium
-if errorlevel 1 echo Voice download failed. Speech output will be unavailable until you prepare the voice files.
+python -m piper.download_voices --download-dir "models\piper-voices" en_US-amy-medium
+if errorlevel 1 echo Voice download failed. Run setup_windows.bat again and choose Yes before building.
 :skip_tts
 where.exe ollama >nul 2>nul
 if errorlevel 1 (

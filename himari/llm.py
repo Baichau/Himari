@@ -61,7 +61,8 @@ class LLM:
                         except TypeError as e: result=f"Invalid arguments: {e}"
                         except Exception as e: result=f"Tool error: {e}"
                 db.log_action(name,args,result,allowed)
-                if on_tool: on_tool(name,args,result)
+                if on_tool and not (handler and handler.get("silent", False)):
+                    on_tool(name,args,result)
                 messages.append({"role":"tool","content":str(result),"tool_name":name})
         raise LLMError("Tool execution stopped unexpectedly.")
     def vision(self,image_b64,prompt):

@@ -1,5 +1,8 @@
 from unittest.mock import patch
 
+from unittest.mock import MagicMock, Mock, patch
+from urllib.error import URLError
+
 import pytest
 
 from himari import db, tools
@@ -115,6 +118,59 @@ def test_web_search_encodes_query():
     with patch.object(tools, "open_url") as open_url:
         tools.search_web("song & artist")
     open_url.assert_called_once_with("https://www.google.com/search?q=song+%26+artist")
+
+
+def test_background_research_returns_sources_without_opening_a_browser(monkeypatch):
+    document = (
+        '<a class="result-link" href="https://duckduckgo.com/l/?uddg='
+        'https%3A%2F%2Fexample.com%2Fnews">Latest &amp; trusted story</a>'
+        '<td class="result-snippet">Current <b>details</b> from today.</td>'
+    ).encode()
+    response = MagicMock()
+    response.status = 200
+    response.headers.get_content_charset.return_value = "utf-8"
+    response.read.return_value = document
+    response.__enter__.return_value = response
+    response.__exit__.return_value = False
+    monkeypatch.setattr(tools, "_perm", lambda name: name == "allow_web_research")
+    open_search = Mock(return_value=response)
+    monkeypatch.setattr(tools, "urlopen", open_search)
+    monkeypatch.setattr(tools.webbrowser, "open", Mock(side_effect=AssertionError("browser must stay closed")))
+
+    result = tools.research_web("today's news")
+
+    assert "Latest & trusted story" in result
+    assert "Current details from today." in result
+    assert "https://example.com/news" in result
+    open_search.assert_called_once()
+    assert open_search.call_args.kwargs["timeout"] == tools.WEB_RESEARCH_TIMEOUT_SECONDS
+    assert "q=today%27s+news" in open_search.call_args.args[0].full_url
+
+
+def test_background_research_fails_closed_when_disabled(monkeypatch):
+    open_search = Mock(side_effect=AssertionError("must not make a request"))
+    monkeypatch.setattr(tools, "_perm", lambda name: False)
+    monkeypatch.setattr(tools, "urlopen", open_search)
+
+    assert "disabled in Settings" in tools.research_web("latest news")
+    open_search.assert_not_called()
+
+
+def test_background_research_reports_unavailable_internet(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    monkeypatch.setattr(tools, "urlopen", Mock(side_effect=URLError(TimeoutError())))
+
+    assert "internet may be unavailable" in tools.research_web("latest news")
+
+
+def test_background_research_rejects_empty_or_oversized_queries(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    open_search = Mock(side_effect=AssertionError("invalid query must not make a request"))
+    monkeypatch.setattr(tools, "urlopen", open_search)
+
+    assert "Tell me what topic" in tools.research_web(" ")
+    assert "too long" in tools.research_web("x" * (tools.WEB_RESEARCH_MAX_QUERY_LENGTH + 1))
+    open_search.assert_not_called()
 
 
 def test_youtube_search_uses_youtube_url():

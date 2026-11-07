@@ -17,10 +17,21 @@ if (speech_model / 'model.bin').is_file():
         (str(speech_model / name), 'models/large-v3-turbo')
         for name in required_model_files
     ]
+piper_voice = Path(SPECPATH) / 'models' / 'piper-voices'
+required_voice_files = ['en_US-amy-medium.onnx', 'en_US-amy-medium.onnx.json']
+missing_voice_files = [name for name in required_voice_files if not (piper_voice / name).is_file()]
+if missing_voice_files:
+    raise FileNotFoundError(f"Incomplete bundled English voice: {', '.join(missing_voice_files)}")
+datas += [
+    (str(piper_voice / name), 'voices')
+    for name in required_voice_files
+]
 binaries = []
 hiddenimports = ['PySide6.QtSvg', 'keyboard']
 datas += collect_data_files('_sounddevice_data')
 tmp_ret = collect_all('piper')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('emoji')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('faster_whisper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
