@@ -98,6 +98,37 @@ def test_stt_loads_only_models_already_available_locally(monkeypatch):
     assert loader.call_args.kwargs["local_files_only"] is True
 
 
+def test_stt_finds_bundled_model_and_prefers_it_to_the_english_fallback(tmp_path, monkeypatch):
+    module_dir = tmp_path / "himari"
+    module_dir.mkdir()
+    model_dir = tmp_path / "models" / "large-v3-turbo"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.bin").touch()
+    (model_dir / "config.json").touch()
+    monkeypatch.setattr(voice, "__file__", str(module_dir / "voice.py"))
+    monkeypatch.setattr(voice, "load", lambda: {
+        "voice": {"stt_model": "large-v3", "recognition_language": "auto"},
+    })
+
+    assert voice._cached_stt_model("large-v3-turbo") == str(model_dir)
+    assert voice._preferred_stt_model() == str(model_dir)
+
+
+def test_stt_prefers_bundled_multilingual_model_over_saved_english_model(tmp_path, monkeypatch):
+    module_dir = tmp_path / "himari"
+    module_dir.mkdir()
+    model_dir = tmp_path / "models" / "large-v3-turbo"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.bin").touch()
+    (model_dir / "config.json").touch()
+    monkeypatch.setattr(voice, "__file__", str(module_dir / "voice.py"))
+    monkeypatch.setattr(voice, "load", lambda: {
+        "voice": {"stt_model": "base.en", "recognition_language": "en"},
+    })
+
+    assert voice._preferred_stt_model() == str(model_dir)
+
+
 def test_tts_reports_missing_voice_without_crashing(tmp_path, monkeypatch):
     monkeypatch.setattr(voice, "APP_DIR", tmp_path)
     monkeypatch.setattr(voice, "load", lambda: {
@@ -203,6 +234,19 @@ def test_normalize_audio_removes_dc_offset_and_amplifies_quiet_speech():
     assert abs(float(np.mean(normalized))) < 1e-5
     assert np.max(np.abs(normalized)) == pytest.approx(0.4)
     assert np.max(np.abs(voice.normalize_audio(np.full(100, 0.25)))) == 0
+
+
+@pytest.mark.parametrize(
+    "recognized",
+    [
+        "Open Minecraft Launcher",
+        "OpenMainerCraft Launcher",
+        "OpenMinerCraftLauncher",
+        "Please open the miner craft launcher",
+    ],
+)
+def test_corrects_minecraft_launcher_voice_transcription(recognized):
+    assert voice.correct_known_voice_commands(recognized) == "Open Minecraft Launcher"
 
 
 def test_tts_prefers_language_matching_voice(tmp_path, monkeypatch):

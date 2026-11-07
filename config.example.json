@@ -1,6 +1,6 @@
 {
   "ollama": {"host":"http://127.0.0.1:11434","chat_model":"qwen3:8b","vision_model":"qwen3:8b","temperature":0.7,"timeout_seconds":180},
-  "voice": {"stt_model":"large-v3","tts_voice":"en_US-lessac-medium","volume":1.0,"push_to_talk_key":"f9","language":"en","recognition_language":"auto","wake_word_enabled":false,"wake_word":"Himari","microphone_device":null,"sensitivity":0.75},
+  "voice": {"stt_model":"large-v3-turbo","tts_voice":"en_US-lessac-medium","volume":1.0,"push_to_talk_key":"f9","language":"en","recognition_language":"auto","wake_word_enabled":false,"wake_word":"Himari","microphone_device":null,"sensitivity":0.75},
   "screen": {"allow_capture":false,"monitor":"active","vision_enabled":false},
   "privacy": {"store_conversations":true,"auto_memory":true},
   "permissions": {"allow_open_app":true,"allow_open_url":true,"allow_volume":true,"allow_read_file":true,"allow_run_command":false,"allow_write_file":false,"allowed_folders":["~/Documents","~/Downloads"]},

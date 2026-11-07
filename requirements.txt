@@ -1,6 +1,7 @@
 PySide6>=6.7
 ollama>=0.6.3
 faster-whisper>=1.0.0
+huggingface-hub>=0.23.0
 av>=11,<19
 piper-tts>=1.2.0
 sounddevice>=0.4.6

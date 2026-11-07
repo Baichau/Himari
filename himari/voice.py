@@ -5,12 +5,24 @@ import numpy as np, sounddevice as sd
 from .config import load, save, APP_DIR
 log=logging.getLogger("himari.voice")
 _UNSET = object()
+_MINECRAFT_LAUNCHER_COMMAND = re.compile(
+    r"\b(?:please\s+)?(?:open|launch|start)\s*(?:the\s*)?"
+    r"(?:minecraft|mine\s*craft|miner\s*craft|mainer\s*craft)\s*launcher\b",
+    re.IGNORECASE,
+)
+
+
+def correct_known_voice_commands(text):
+    return _MINECRAFT_LAUNCHER_COMMAND.sub("Open Minecraft Launcher", text)
 
 
 def _cached_stt_model(name):
     local_path = Path(name).expanduser()
     if local_path.is_dir():
         return str(local_path.resolve())
+    bundled_path = Path(__file__).resolve().parents[1] / "models" / name
+    if (bundled_path / "model.bin").is_file() and (bundled_path / "config.json").is_file():
+        return str(bundled_path)
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
     except ImportError:
@@ -29,8 +41,11 @@ def _preferred_stt_model():
     cfg = load()["voice"]
     preferred = str(cfg.get("stt_model") or "large-v3").strip() or "large-v3"
     language = str(cfg.get("recognition_language") or cfg.get("language") or "en").lower()
+    preferred_path = Path(preferred).expanduser()
     candidates = [
-        preferred, "large-v3", "distil-large-v3", "large-v3-turbo",
+        preferred if preferred_path.is_dir() else "large-v3-turbo",
+        "large-v3", "distil-large-v3",
+        preferred,
         "large", "medium", "small", "base.en", "base", "tiny.en", "tiny",
     ]
     if language in {"", "auto"} and preferred.lower().endswith(".en"):
@@ -47,8 +62,9 @@ def _preferred_stt_model():
             and candidate.lower().endswith(".en")
         ):
             continue
-        if _cached_stt_model(candidate):
-            return candidate
+        available_model = _cached_stt_model(candidate)
+        if available_model:
+            return available_model
     language_name = "English" if language.startswith("en") else "multilingual"
     raise RuntimeError(
         f"No {language_name} faster-whisper model is available locally. "

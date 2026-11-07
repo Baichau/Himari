@@ -1,8 +1,22 @@
 # -*- mode: python ; coding: utf-8 -*-
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('config.example.json', '.')]
+datas = [('config.example.json', '.'), ('THIRD_PARTY_NOTICES.txt', '.')]
+speech_model = Path(SPECPATH) / 'models' / 'large-v3-turbo'
+if (speech_model / 'model.bin').is_file():
+    required_model_files = [
+        'config.json', 'model.bin', 'preprocessor_config.json',
+        'tokenizer.json', 'vocabulary.json',
+    ]
+    missing_model_files = [name for name in required_model_files if not (speech_model / name).is_file()]
+    if missing_model_files:
+        raise FileNotFoundError(f"Incomplete bundled speech model: {', '.join(missing_model_files)}")
+    datas += [
+        (str(speech_model / name), 'models/large-v3-turbo')
+        for name in required_model_files
+    ]
 binaries = []
 hiddenimports = ['PySide6.QtSvg', 'keyboard']
 datas += collect_data_files('_sounddevice_data')

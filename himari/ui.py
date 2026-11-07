@@ -9,7 +9,7 @@ from PySide6.QtSvg import QSvgRenderer
 from .config import load, save
 from . import db, persona
 from .llm import LLM
-from .voice import STT, TTS, Mic, WakeWordMonitor
+from .voice import STT, TTS, Mic, WakeWordMonitor, correct_known_voice_commands
 from .screen import capture, analyze
 from .tools import TOOLS
 log=logging.getLogger("himari.ui")
@@ -408,7 +408,7 @@ class UI(QMainWindow):
             except Exception as exc:
                 self._status(f"Microphone error: {exc}")
     def _apply_voice_text(self,text):
-        self.input.setText(text)
+        self.input.setText(correct_known_voice_commands(text))
         self.send()
     def _capture_permission_changed(self,allowed):
         cfg=load(); cfg["screen"]["allow_capture"]=allowed; save(cfg)

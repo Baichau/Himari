@@ -15,10 +15,10 @@ if exist "wheelhouse" (
     python -m pip install -r requirements.txt
 )
 if errorlevel 1 exit /b 1
-choice /c YN /m "Download a local multilingual faster-whisper model (large-v3) now"
+choice /c YN /m "Download and bundle the multilingual faster-whisper large-v3-turbo model (1.62 GB) now"
 if errorlevel 2 goto skip_stt
-python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', device='cpu', compute_type='int8', local_files_only=False)"
-if errorlevel 1 echo Speech model download failed. Speech recognition will be unavailable until you prepare a multilingual local model.
+python prepare_speech_model.py
+if errorlevel 1 echo Speech model download failed. Rerun setup_windows.bat and choose Yes before building the standalone app.
 :skip_stt
 choice /c YN /m "Download the optional Piper en_US-lessac-medium voice now"
 if errorlevel 2 goto skip_tts

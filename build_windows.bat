@@ -5,19 +5,14 @@ if not exist ".venv\Scripts\python.exe" (
     echo Please run setup_windows.bat first.
     exit /b 1
 )
+if not exist "models\large-v3-turbo\model.bin" (
+    echo The bundled multilingual speech model is missing.
+    echo Run setup_windows.bat and choose Yes to prepare it, then rebuild.
+    exit /b 1
+)
 call ".venv\Scripts\activate.bat"
 if errorlevel 1 exit /b 1
-python -m PyInstaller --noconfirm --clean --windowed --onedir --name Himari ^
-    --collect-all piper ^
-    --collect-all faster_whisper ^
-    --collect-all ctranslate2 ^
-    --collect-all onnxruntime ^
-    --collect-all av ^
-    --collect-data _sounddevice_data ^
-    --add-data "config.example.json;." ^
-    --hidden-import PySide6.QtSvg ^
-    --hidden-import keyboard ^
-    himari_launcher.py
+python -m PyInstaller --noconfirm --clean Himari.spec
 if errorlevel 1 exit /b 1
 echo Application built: dist\Himari\Himari.exe
 set "ISCC="
