@@ -3,6 +3,13 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_all
 
+try:
+    import emoji
+except ImportError as exc:
+    raise RuntimeError(
+        "The required 'emoji' package is missing. Run setup_windows.bat before building."
+    ) from exc
+
 datas = [('config.example.json', '.'), ('THIRD_PARTY_NOTICES.txt', '.')]
 speech_model = Path(SPECPATH) / 'models' / 'large-v3-turbo'
 if (speech_model / 'model.bin').is_file():
