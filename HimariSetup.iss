@@ -16,7 +16,7 @@ SolidCompression=yes
 WizardStyle=modern
 
 [Files]
-Source: "dist\Himari\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\Himari.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Himari"; Filename: "{app}\Himari.exe"

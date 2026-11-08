@@ -19,7 +19,7 @@ call ".venv\Scripts\activate.bat"
 if errorlevel 1 exit /b 1
 python -m PyInstaller --noconfirm --clean Himari.spec
 if errorlevel 1 exit /b 1
-echo Application built: dist\Himari\Himari.exe
+echo Single-file application built: dist\Himari.exe
 set "ISCC="
 for /f "delims=" %%I in ('where ISCC.exe 2^>nul') do set "ISCC=%%I"
 if not defined ISCC if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
