@@ -16,7 +16,7 @@ log=logging.getLogger("himari.ui")
 class UI(QMainWindow):
     token=Signal(str); status=Signal(str); done=Signal(str); tool=Signal(str)
     failed=Signal(str); voice_result=Signal(str); screen_result=Signal(str,str); screen_error=Signal(str)
-    hotkey_pressed=Signal(); confirmation_requested=Signal(object)
+    hotkey_pressed=Signal(); screen_hotkey_pressed=Signal(); confirmation_requested=Signal(object)
     auto_stop_requested=Signal(); wake_word_detected_signal=Signal(str)
     def __init__(self):
         super().__init__(); self.setWindowTitle("Himari ひまり"); self.resize(1000,700)
@@ -25,9 +25,11 @@ class UI(QMainWindow):
             on_error=lambda message:self.status.emit(f"TTS error: {message}"),
             on_finished=lambda:self.status.emit("Ready."),
         )
-        self.mic=Mic(); self.stt=None; self.busy=False; self.hotkey_id=None
+        self.mic=Mic(); self.stt=None; self.busy=False
+        self.hotkey_id=None; self.screen_hotkey_id=None
         self._streamed_response = ""
         self.hotkey_error = None
+        self.screen_hotkey_error = None
         self.wake_word_monitor = WakeWordMonitor(
             on_detect=self.wake_word_detected_signal.emit,
             on_error=self.status.emit,
@@ -35,6 +37,7 @@ class UI(QMainWindow):
         self.wake_word_status = QLabel("Wake-word: idle")
         self.wake_word_status.setStyleSheet("color: #8b8b8b;")
         self.tray=None
+        self.capture_tray_action=None
         self._allow_quit = False
         self._init_tray()
         self.token.connect(self._token); self.status.connect(self._status)
@@ -42,6 +45,7 @@ class UI(QMainWindow):
         self.failed.connect(self._failed); self.voice_result.connect(self._apply_voice_text)
         self.screen_result.connect(self._screen_result); self.screen_error.connect(self._screen_failed)
         self.hotkey_pressed.connect(self.toggle_mic)
+        self.screen_hotkey_pressed.connect(self.screen_query)
         self.confirmation_requested.connect(self._confirm_tool)
         self.auto_stop_requested.connect(self._auto_stop_mic)
         self.wake_word_detected_signal.connect(self._wake_word_detected)
@@ -84,7 +88,8 @@ class UI(QMainWindow):
         row=QHBoxLayout()
         self.mic_btn=QPushButton("🎤 Talk (F9)"); self.mic_btn.clicked.connect(self.toggle_mic)
         self.stop_btn=QPushButton("⏹ Stop Voice"); self.stop_btn.clicked.connect(self.tts.stop)
-        self.analyze_btn=QPushButton("📷 Capture Screen & Ask"); self.analyze_btn.clicked.connect(self.screen_query)
+        screen_key = load().get("screen", {}).get("capture_hotkey", "f10").upper()
+        self.analyze_btn=QPushButton(f"📷 Capture Screen ({screen_key})"); self.analyze_btn.clicked.connect(self.screen_query)
         self.clear_btn=QPushButton("🗑 Clear Chat"); self.clear_btn.clicked.connect(self.clear_chat)
         for b in [self.mic_btn,self.stop_btn,self.analyze_btn,self.clear_btn]: row.addWidget(b)
         v.addLayout(row)
@@ -164,6 +169,10 @@ class UI(QMainWindow):
         self.wake_word_field=QLineEdit(load()["voice"].get("wake_word","Himari"))
         self.vol=QSlider(Qt.Horizontal); self.vol.setRange(0,100); self.vol.setValue(int(load()["voice"]["volume"]*100))
         self.hotkey=QLineEdit(load()["voice"]["push_to_talk_key"])
+        self.screen_hotkey=QLineEdit(load().get("screen", {}).get("capture_hotkey", "f10"))
+        self.screen_hotkey.textChanged.connect(
+            lambda key:self.analyze_btn.setText(f"📷 Capture Screen ({key.strip().upper() or 'F10'})")
+        )
         for w in [self.cb_store,self.cb_apps,self.cb_web,self.cb_research,self.cb_cmd,self.cb_write,self.cb_wake,
                   self.cb_always_on_top,self.cb_minimize_to_tray,
                   QLabel("Folders available to file tools:"),self.allowed_folders]: sv.addWidget(w)
@@ -174,27 +183,72 @@ class UI(QMainWindow):
                   QLabel("Wake-word sensitivity:"),self.sensitivity,
                   QLabel("Voice (English default; Russian falls back to Windows):"),self.voice_box,
                   QLabel("Chat model:"),self.model_box,
-                  QLabel("TTS volume:"),self.vol,QLabel("Push-to-talk key:"),self.hotkey]: sv.addWidget(w)
+                  QLabel("TTS volume:"),self.vol,QLabel("Push-to-talk key:"),self.hotkey,
+                  QLabel("Global screen-capture key:"),self.screen_hotkey]: sv.addWidget(w)
         sv.addStretch(); tabs.addTab(st,"Settings")
         self.refresh_mem()
         self.refresh_actions()
         QTimer.singleShot(300,self.check)
-        self._bind_hotkey()
+        self._bind_hotkeys()
         if self.cb_wake.isChecked():
             self._toggle_wake_word(True)
-    def _bind_hotkey(self):
-        key = "f9"
+    def _bind_hotkeys(self):
+        self._remove_hotkeys()
+        ptt_key = str(load()["voice"].get("push_to_talk_key") or "f9").strip()
+        screen_key = str(load().get("screen", {}).get("capture_hotkey") or "f10").strip()
+        self.hotkey_error = None
+        self.screen_hotkey_error = None
         try:
             import keyboard
-            key=load()["voice"]["push_to_talk_key"]
-            self.hotkey_id=keyboard.add_hotkey(key,lambda:self.hotkey_pressed.emit())
         except Exception as e:
-            self.hotkey_error = f"Push-to-talk hotkey '{key}' is unavailable; use the microphone button. ({e})"
-            log.warning("Hotkey bind failed: %s",e)
+            self.hotkey_error = f"Push-to-talk hotkey is unavailable; use the microphone button. ({e})"
+            self.screen_hotkey_error = f"Screen-capture hotkey is unavailable. ({e})"
+            log.warning("Global hotkey setup failed: %s", e)
+            return
+        if self.tray is not None:
+            self.tray.setToolTip(
+                f"Himari — {screen_key.upper()} screen capture; close hides to tray."
+            )
+        if self.capture_tray_action is not None:
+            self.capture_tray_action.setText(f"Capture Screen ({screen_key.upper()})")
+        try:
+            self.hotkey_id=keyboard.add_hotkey(ptt_key,lambda:self.hotkey_pressed.emit())
+        except Exception as e:
+            self.hotkey_error = f"Push-to-talk hotkey '{ptt_key}' is unavailable; use the microphone button. ({e})"
+            log.warning("Push-to-talk hotkey bind failed: %s", e)
+        if screen_key.casefold() == ptt_key.casefold():
+            self.screen_hotkey_error = "Screen-capture and push-to-talk keys must be different."
+            return
+        try:
+            self.screen_hotkey_id=keyboard.add_hotkey(
+                screen_key, lambda:self.screen_hotkey_pressed.emit()
+            )
+        except Exception as e:
+            self.screen_hotkey_error = f"Screen-capture hotkey '{screen_key}' is unavailable. ({e})"
+            log.warning("Screen-capture hotkey bind failed: %s", e)
+    def _remove_hotkeys(self):
+        hotkey_ids = (self.hotkey_id, self.screen_hotkey_id)
+        self.hotkey_id = None
+        self.screen_hotkey_id = None
+        if not any(hotkey_id is not None for hotkey_id in hotkey_ids):
+            return
+        try:
+            import keyboard
+        except Exception as e:
+            log.warning("Could not load keyboard module during hotkey cleanup: %s", e)
+            return
+        for hotkey_id in hotkey_ids:
+            if hotkey_id is not None:
+                try:
+                    keyboard.remove_hotkey(hotkey_id)
+                except Exception as e:
+                    log.warning("Hotkey cleanup failed: %s", e)
     def check(self):
         message = "Ollama connected ✓" if self.llm.ping() else "Ollama unreachable — start Ollama and pull qwen3:8b."
         if self.hotkey_error:
             message = f"{message} {self.hotkey_error}"
+        if self.screen_hotkey_error:
+            message = f"{message} {self.screen_hotkey_error}"
         self._status(message)
         self._refresh_wake_word_status()
     def _set_avatar_state(self, state):
@@ -244,12 +298,16 @@ class UI(QMainWindow):
         menu = QMenu(self)
         show_action = menu.addAction("Show Himari")
         show_action.triggered.connect(lambda: (self.show(), self.raise_(), self.activateWindow()))
+        screen_key = load().get("screen", {}).get("capture_hotkey", "f10").upper()
+        self.capture_tray_action = menu.addAction(f"Capture Screen ({screen_key})")
+        self.capture_tray_action.triggered.connect(self.screen_query)
         hide_action = menu.addAction("Hide")
         hide_action.triggered.connect(self.hide)
         quit_action = menu.addAction("Quit")
         quit_action.triggered.connect(self._quit_from_tray)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._tray_activated)
+        self.tray.setToolTip(f"Himari — {screen_key} captures the screen; close to keep running in the tray.")
         self.tray.show()
     def _tray_activated(self, reason):
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
@@ -259,7 +317,7 @@ class UI(QMainWindow):
                 self.hide()
     def _quit_from_tray(self):
         self._allow_quit = True
-        QApplication.instance().quit()
+        self.close()
     def _set_always_on_top(self, enabled):
         flags = self.windowFlags()
         if enabled:
@@ -439,11 +497,15 @@ class UI(QMainWindow):
         threading.Thread(target=work,daemon=True).start()
     def _screen_result(self,text,question):
         self.analyze_btn.setEnabled(True)
+        if self.isHidden():
+            self.show(); self.raise_(); self.activateWindow()
         self.chat.append(f"\n[Screen text extracted; screenshot discarded]\n{text[:2000]}\n")
         self.input.setText(question or "Please read the text captured from my screen and explain what it shows.")
         self.send(screen_context=text)
     def _screen_failed(self,message):
         self.analyze_btn.setEnabled(True)
+        if self.isHidden():
+            self.show(); self.raise_(); self.activateWindow()
         self._status(message)
     def clear_chat(self):
         self.chat.clear(); db.clear_session(self.session)
@@ -470,13 +532,6 @@ class UI(QMainWindow):
         if row<0: return
         m=db.memories()[row]; db.delete_memory(m["id"]); self.refresh_mem()
     def closeEvent(self,e):
-        self.tts.stop()
-        if self.mic.rec: self.mic.stop()
-        if self.hotkey_id is not None:
-            try:
-                import keyboard
-                keyboard.remove_hotkey(self.hotkey_id)
-            except Exception as err: log.warning("Hotkey cleanup failed: %s",err)
         cfg=load()
         cfg["privacy"]["store_conversations"]=self.cb_store.isChecked()
         cfg["permissions"]["allow_open_app"]=self.cb_apps.isChecked()
@@ -499,11 +554,19 @@ class UI(QMainWindow):
         cfg["voice"]["sensitivity"]=max(0.1, min(1.0, self.sensitivity.value()/100))
         cfg["voice"]["recognition_language"] = self._recognition_language()
         cfg["voice"]["language"] = cfg["voice"]["recognition_language"]
+        cfg.setdefault("screen", {})["capture_hotkey"] = self.screen_hotkey.text().strip() or "f10"
         save(cfg)
+        self.tts.stop()
+        if self.mic.rec: self.mic.stop()
         if self.tray is not None and self.cb_minimize_to_tray.isChecked() and not self._allow_quit:
+            self._bind_hotkeys()
             self.hide();
             e.ignore();
             return
+        self.wake_word_monitor.stop()
+        self._remove_hotkeys()
+        if self.tray is not None:
+            self.tray.hide()
         self._allow_quit = False
         super().closeEvent(e)
 def run():
