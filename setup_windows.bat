@@ -31,7 +31,5 @@ if errorlevel 1 (
 ) else (
     echo Ollama is installed. If needed, prepare the chat model separately with: ollama pull qwen3:8b
 )
-where.exe tesseract >nul 2>nul
-if errorlevel 1 echo Tesseract was not found. Install Tesseract OCR to use OCR-based screen analysis.
 echo Setup complete. Run run_himari.bat.
 pause

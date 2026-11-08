@@ -165,11 +165,17 @@ def test_tts_finds_bundled_amy_voice_and_replaces_legacy_lessac_default(tmp_path
     [
         ("Hello 😊", "en", "Hello smiling face"),
         ("Привет 😊", "ru", "Привет улыбающееся лицо"),
-        ("Keep <3", "en", "Keep <3"),
+        ("Keep <3", "en", "Keep heart"),
     ],
 )
 def test_speech_text_demojizes_without_mutating_display_text(text, language, expected):
     assert voice.speech_text(text, language) == expected
+
+
+def test_speech_text_removes_urls_markdown_and_nonspoken_symbols():
+    assert voice.speech_text(
+        "**Hello, #friend!** [Read this](https://example.com) 😊"
+    ) == "Hello friend! Read this smiling face"
 
 
 def test_tts_routes_each_sentence_to_its_language():
@@ -180,6 +186,38 @@ def test_tts_routes_each_sentence_to_its_language():
         ("Привет, Химари!", "ru"),
         ("😊", "ru"),
     ]
+
+
+def test_tts_synthesizes_complete_same_language_reply_as_one_audio_clip(tmp_path, monkeypatch):
+    synthesized = []
+
+    class FakePiperVoice:
+        @staticmethod
+        def load(model):
+            return FakePiperVoice()
+
+        def synthesize_wav(self, text, output, syn_config=None):
+            synthesized.append(text)
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(22050)
+            output.writeframes(b"\x00\x00" * 10)
+
+    monkeypatch.setattr(voice, "APP_DIR", tmp_path)
+    monkeypatch.setattr(voice, "load", lambda: {
+        "voice": {"tts_voice": "en_US-amy-medium", "recognition_language": "en", "volume": 1.0},
+    })
+    monkeypatch.setitem(sys.modules, "piper", SimpleNamespace(PiperVoice=FakePiperVoice))
+    tts = TTS()
+    monkeypatch.setattr(tts, "_synthesis_config", lambda sentence: None)
+    monkeypatch.setattr(tts, "_resolve_voice_path", lambda language: tmp_path / "amy.onnx")
+    played = Mock()
+    monkeypatch.setattr(tts, "_play", played)
+
+    tts._run("First sentence. Then, #the entire reply 😊!", threading.Event())
+
+    assert synthesized == ["First sentence. Then the entire reply smiling face!"]
+    played.assert_called_once()
 
 
 def test_windows_speech_uses_installed_voice_matching_language():

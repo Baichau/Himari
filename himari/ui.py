@@ -1,4 +1,4 @@
-import sys, threading, io, logging
+import sys, threading, logging
 from datetime import datetime
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QTextEdit,
  QLineEdit,QPushButton,QLabel,QListWidget,QCheckBox,QComboBox,QSlider,QTabWidget,QInputDialog,QFileDialog,
@@ -10,12 +10,12 @@ from .config import load, save
 from . import db, persona
 from .llm import LLM
 from .voice import STT, TTS, Mic, WakeWordMonitor, correct_known_voice_commands
-from .screen import capture, analyze
+from .screen import analyze
 from .tools import TOOLS
 log=logging.getLogger("himari.ui")
 class UI(QMainWindow):
     token=Signal(str); status=Signal(str); done=Signal(str); tool=Signal(str)
-    failed=Signal(str); voice_result=Signal(str); screen_result=Signal(str); screen_error=Signal(str)
+    failed=Signal(str); voice_result=Signal(str); screen_result=Signal(str,str); screen_error=Signal(str)
     hotkey_pressed=Signal(); confirmation_requested=Signal(object)
     auto_stop_requested=Signal(); wake_word_detected_signal=Signal(str)
     def __init__(self):
@@ -40,7 +40,7 @@ class UI(QMainWindow):
         self.token.connect(self._token); self.status.connect(self._status)
         self.done.connect(self._done); self.tool.connect(self._tool)
         self.failed.connect(self._failed); self.voice_result.connect(self._apply_voice_text)
-        self.screen_result.connect(self._screen_result); self.screen_error.connect(self._status)
+        self.screen_result.connect(self._screen_result); self.screen_error.connect(self._screen_failed)
         self.hotkey_pressed.connect(self.toggle_mic)
         self.confirmation_requested.connect(self._confirm_tool)
         self.auto_stop_requested.connect(self._auto_stop_mic)
@@ -81,20 +81,12 @@ class UI(QMainWindow):
         self._set_avatar_state("Idle")
         v.addWidget(self.avatar_state)
         v.addWidget(self.chat)
-        self.screen_preview=QLabel("Live screen preview is off")
-        self.screen_preview.setAlignment(Qt.AlignCenter)
-        self.screen_preview.setMinimumHeight(160); self.screen_preview.setMaximumHeight(240)
-        self.screen_preview.setStyleSheet("background: #211b27; color: #c8b9c9; border-radius: 8px;")
-        self.screen_preview.hide(); v.addWidget(self.screen_preview)
-        self.screen_timer=QTimer(self); self.screen_timer.setInterval(1000)
-        self.screen_timer.timeout.connect(self._update_live_screen)
         row=QHBoxLayout()
         self.mic_btn=QPushButton("🎤 Talk (F9)"); self.mic_btn.clicked.connect(self.toggle_mic)
         self.stop_btn=QPushButton("⏹ Stop Voice"); self.stop_btn.clicked.connect(self.tts.stop)
-        self.screen_btn=QPushButton("▶ Live Screen"); self.screen_btn.clicked.connect(self.toggle_live_screen)
-        self.analyze_btn=QPushButton("🔎 Analyze Screen"); self.analyze_btn.clicked.connect(self.screen_query)
+        self.analyze_btn=QPushButton("📷 Capture Screen & Ask"); self.analyze_btn.clicked.connect(self.screen_query)
         self.clear_btn=QPushButton("🗑 Clear Chat"); self.clear_btn.clicked.connect(self.clear_chat)
-        for b in [self.mic_btn,self.stop_btn,self.screen_btn,self.analyze_btn,self.clear_btn]: row.addWidget(b)
+        for b in [self.mic_btn,self.stop_btn,self.analyze_btn,self.clear_btn]: row.addWidget(b)
         v.addLayout(row)
         row2=QHBoxLayout(); self.input=QLineEdit(); self.input.setPlaceholderText("Talk to Himari…")
         self.input.returnPressed.connect(self.send)
@@ -116,9 +108,6 @@ class UI(QMainWindow):
         mv.addLayout(mrow); tabs.addTab(mem,"Memory")
         # Settings tab
         st=QWidget(); sv=QVBoxLayout(st)
-        self.cb_capture=QCheckBox("Allow screen capture"); self.cb_capture.setChecked(load()["screen"]["allow_capture"])
-        self.cb_capture.toggled.connect(self._capture_permission_changed)
-        self.cb_vision=QCheckBox("Use vision model for screen understanding"); self.cb_vision.setChecked(load()["screen"]["vision_enabled"])
         self.cb_store=QCheckBox("Store conversations locally"); self.cb_store.setChecked(load()["privacy"]["store_conversations"])
         self.cb_apps=QCheckBox("Allow opening apps and Steam games"); self.cb_apps.setChecked(load()["permissions"]["allow_open_app"])
         self.cb_web=QCheckBox("Allow opening websites"); self.cb_web.setChecked(load()["permissions"]["allow_open_url"])
@@ -164,8 +153,6 @@ class UI(QMainWindow):
             self.voice_box.setCurrentText(configured_voice)
         self.model_box=QComboBox(); self.model_box.addItems(self.llm.list_models() or ["qwen3:8b"])
         self.model_box.setCurrentText(load()["ollama"]["chat_model"])
-        self.vision_box=QComboBox(); self.vision_box.addItems(self.llm.list_models() or ["qwen3:8b"])
-        self.vision_box.setCurrentText(load()["ollama"]["vision_model"])
         self.lang_box=QComboBox()
         self.lang_box.addItem("Automatic", "auto")
         self.lang_box.addItem("English", "en")
@@ -177,7 +164,7 @@ class UI(QMainWindow):
         self.wake_word_field=QLineEdit(load()["voice"].get("wake_word","Himari"))
         self.vol=QSlider(Qt.Horizontal); self.vol.setRange(0,100); self.vol.setValue(int(load()["voice"]["volume"]*100))
         self.hotkey=QLineEdit(load()["voice"]["push_to_talk_key"])
-        for w in [self.cb_capture,self.cb_vision,self.cb_store,self.cb_apps,self.cb_web,self.cb_research,self.cb_cmd,self.cb_write,self.cb_wake,
+        for w in [self.cb_store,self.cb_apps,self.cb_web,self.cb_research,self.cb_cmd,self.cb_write,self.cb_wake,
                   self.cb_always_on_top,self.cb_minimize_to_tray,
                   QLabel("Folders available to file tools:"),self.allowed_folders]: sv.addWidget(w)
         sv.addLayout(folder_row)
@@ -186,7 +173,7 @@ class UI(QMainWindow):
                   QLabel("Wake word:"),self.wake_word_field,
                   QLabel("Wake-word sensitivity:"),self.sensitivity,
                   QLabel("Voice (English default; Russian falls back to Windows):"),self.voice_box,
-                  QLabel("Chat model:"),self.model_box,QLabel("Vision model:"),self.vision_box,
+                  QLabel("Chat model:"),self.model_box,
                   QLabel("TTS volume:"),self.vol,QLabel("Push-to-talk key:"),self.hotkey]: sv.addWidget(w)
         sv.addStretch(); tabs.addTab(st,"Settings")
         self.refresh_mem()
@@ -317,7 +304,7 @@ class UI(QMainWindow):
             else:
                 self._status("No response to speak.")
         except Exception as e: self._status(f"TTS unavailable: {e}")
-    def send(self):
+    def send(self, screen_context=None):
         if self.busy: return
         text=self.input.text().strip()
         if not text: return
@@ -328,7 +315,13 @@ class UI(QMainWindow):
         if load()["privacy"].get("store_conversations",True): db.add_message(self.session,"user",text)
         relevant = db.relevant_memories(text, limit=8)
         summary = db.summary_for_session(self.session)
-        msgs=persona.build(db.history(self.session), relevant, user_query=text, summary=summary)
+        msgs=persona.build(
+            db.history(self.session),
+            relevant,
+            user_query=text,
+            summary=summary,
+            screen_context=screen_context,
+        )
         threading.Thread(target=self._run,args=(msgs,),daemon=True).start()
     def _run(self,msgs):
         try:
@@ -345,8 +338,17 @@ class UI(QMainWindow):
             self.failed.emit(f"LLM error: {e}")
     def _confirm_tool(self,request):
         name,args,message,result=request
+        if name == "write_desktop_file":
+            content = args.get("content", "")
+            details = (
+                f"File: {args.get('filename', '')}\n"
+                f"Characters: {len(content) if isinstance(content, str) else 0}\n\n"
+                f"Preview: {content[:500] if isinstance(content, str) else ''}"
+            )
+        else:
+            details = str(args)
         answer=QMessageBox.question(self,"Confirm Himari action",
-            f"{message}\n\n{name}: {args}",QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
+            f"{message}\n\n{name}:\n{details}",QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
         result["allowed"]=answer==QMessageBox.Yes
         result["event"].set()
     def _failed(self,message):
@@ -425,48 +427,24 @@ class UI(QMainWindow):
     def _apply_voice_text(self,text):
         self.input.setText(correct_known_voice_commands(text))
         self.send()
-    def _capture_permission_changed(self,allowed):
-        cfg=load(); cfg["screen"]["allow_capture"]=allowed; save(cfg)
-        if not allowed:
-            self.screen_timer.stop(); self.screen_preview.hide()
-            self.screen_btn.setText("▶ Live Screen")
-    def toggle_live_screen(self):
-        if self.screen_timer.isActive():
-            self.screen_timer.stop(); self.screen_preview.hide()
-            self.screen_btn.setText("▶ Live Screen")
-            return
-        if not self.cb_capture.isChecked():
-            self._status("Enable 'Allow screen capture' in Settings first.")
-            return
-        self.screen_preview.show(); self.screen_btn.setText("■ Stop Live Screen")
-        self._update_live_screen(); self.screen_timer.start()
-    def _update_live_screen(self):
-        try:
-            image=capture(monitor="1")
-            buffer=io.BytesIO(); image.save(buffer,format="PNG")
-            pixmap=QPixmap()
-            if not pixmap.loadFromData(buffer.getvalue(),"PNG"):
-                raise RuntimeError("Could not display the captured screen.")
-            self.screen_preview.setPixmap(pixmap.scaled(
-                self.screen_preview.size(),Qt.KeepAspectRatio,Qt.SmoothTransformation))
-        except Exception as e:
-            self.screen_timer.stop(); self.screen_preview.hide()
-            self.screen_btn.setText("▶ Live Screen")
-            self._status(f"Live screen error: {e}")
     def screen_query(self):
-        if not self.cb_capture.isChecked():
-            self._status("Enable 'Allow screen capture' in Settings first.")
+        if self.busy:
+            self._status("Wait for the current response to finish before capturing the screen.")
             return
-        self.analyze_btn.setEnabled(False); self._status("Analyzing the screen…")
+        question = self.input.text().strip()
+        self.analyze_btn.setEnabled(False); self._status("Capturing the primary screen and reading its text…")
         def work():
-            try: self.screen_result.emit(analyze())
+            try: self.screen_result.emit(analyze(), question)
             except Exception as e: self.screen_error.emit(f"Screen error: {e}")
         threading.Thread(target=work,daemon=True).start()
-    def _screen_result(self,text):
+    def _screen_result(self,text,question):
         self.analyze_btn.setEnabled(True)
-        self.chat.append(f"\n[Screen analysis]\n{text[:2000]}\n")
-        self.input.setText("Please explain this screen analysis and suggest useful next steps:\n"+text[:4000])
-        self.send()
+        self.chat.append(f"\n[Screen text extracted; screenshot discarded]\n{text[:2000]}\n")
+        self.input.setText(question or "Please read the text captured from my screen and explain what it shows.")
+        self.send(screen_context=text)
+    def _screen_failed(self,message):
+        self.analyze_btn.setEnabled(True)
+        self._status(message)
     def clear_chat(self):
         self.chat.clear(); db.clear_session(self.session)
     def refresh_mem(self):
@@ -492,7 +470,6 @@ class UI(QMainWindow):
         if row<0: return
         m=db.memories()[row]; db.delete_memory(m["id"]); self.refresh_mem()
     def closeEvent(self,e):
-        self.screen_timer.stop()
         self.tts.stop()
         if self.mic.rec: self.mic.stop()
         if self.hotkey_id is not None:
@@ -501,8 +478,6 @@ class UI(QMainWindow):
                 keyboard.remove_hotkey(self.hotkey_id)
             except Exception as err: log.warning("Hotkey cleanup failed: %s",err)
         cfg=load()
-        cfg["screen"]["allow_capture"]=self.cb_capture.isChecked()
-        cfg["screen"]["vision_enabled"]=self.cb_vision.isChecked()
         cfg["privacy"]["store_conversations"]=self.cb_store.isChecked()
         cfg["permissions"]["allow_open_app"]=self.cb_apps.isChecked()
         cfg["permissions"]["allow_open_url"]=self.cb_web.isChecked()
@@ -515,7 +490,6 @@ class UI(QMainWindow):
             self.allowed_folders.item(i).text() for i in range(self.allowed_folders.count())
         ]
         cfg["ollama"]["chat_model"]=self.model_box.currentText()
-        cfg["ollama"]["vision_model"]=self.vision_box.currentText()
         cfg["voice"]["volume"]=self.vol.value()/100
         cfg["voice"]["tts_voice"]=self.voice_box.currentText() if self.voice_box.count() else cfg["voice"].get("tts_voice", "en_US-amy-medium")
         cfg["voice"]["push_to_talk_key"]=self.hotkey.text().strip() or "f9"

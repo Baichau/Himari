@@ -27,27 +27,39 @@ def correct_known_voice_commands(text):
 
 def speech_text(text, language="en"):
     locale = "ru" if language == "ru" else "en"
+    text = text.replace("<3", " heart " if locale == "en" else " сердце ")
     text = emoji.demojize(text, language=locale)
     if locale == "en":
         text = re.sub(
-            r":(?:grinning_face(?:_with_smiling_eyes)?|"
-            r"beaming_face_with_smiling_eyes|smile|slightly_smiling_face|"
-            r"smiling_face_with_smiling_eyes):",
+            r":(?:smiling_face_with_smiling_eyes|grinning_face(?:_with_smiling_eyes)?|"
+            r"beaming_face_with_smiling_eyes|slightly_smiling_face|smile):",
             " smiling face ",
             text,
         )
     else:
         text = re.sub(
-            r":(?:улыбается(?:_с_открытым_ртом|_открытым_ртом)?|"
-            r"довольно_улыбается|слегка_улыбается)(?:_тон_кожи_[0-9])?:",
+            r":(?:довольно_улыбается|слегка_улыбается|улыбается(?:_с_открытым_ртом)?):",
             " улыбающееся лицо ",
             text,
         )
-    text = re.sub(
-        r":([A-Za-zА-Яа-яЁё0-9_+\-]+):",
-        lambda match: match.group(1).replace("_", " "),
-        text,
-    )
+    text = re.sub(r":([A-Za-zА-Яа-яЁё0-9_+\-]+):", lambda match: match.group(1).replace("_", " "), text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)|\[([^\]]+)\]\([^)]+\)", lambda match: match.group(1) or match.group(2), text)
+    text = re.sub(r"https?://\S+|www\.\S+", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"```.*?```|`([^`]*)`", lambda match: match.group(1) or " ", text, flags=re.DOTALL)
+    text = re.sub(r"[*_~#>|]+", " ", text)
+
+    spoken = []
+    for char in text:
+        category = unicodedata.category(char)
+        if char in ".?!'’" or category[0] in {"L", "N", "M"}:
+            spoken.append(char)
+        elif char in "\r\n":
+            spoken.append(". ")
+        else:
+            spoken.append(" ")
+    text = "".join(spoken)
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"\s+([.?!])", r"\1", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
@@ -329,6 +341,18 @@ class TTS:
             for part in parts if part.strip()
         ]
 
+    def _speech_segments(self, text):
+        segments = []
+        for sentence, language in self._sentences(text):
+            spoken = speech_text(sentence, language)
+            if not spoken:
+                continue
+            if segments and segments[-1][0] == language:
+                segments[-1] = (language, f"{segments[-1][1]} {spoken}")
+            else:
+                segments.append((language, spoken))
+        return segments
+
     @staticmethod
     def _synthesis_config(sentence):
         from piper.config import SynthesisConfig
@@ -408,11 +432,8 @@ class TTS:
         wav=APP_DIR/f"tts_out_{threading.get_ident()}.wav"
         failed=False
         try:
-            for sent, language in self._sentences(text):
+            for language, spoken in self._speech_segments(text):
                 if stop_event.is_set(): return
-                spoken = speech_text(sent, language)
-                if not spoken:
-                    continue
                 model = self._resolve_voice_path(language)
                 if model is None:
                     if language == "ru":
@@ -434,7 +455,7 @@ class TTS:
                         self._voice.synthesize_wav(
                             spoken,
                             output,
-                            syn_config=self._synthesis_config(sent),
+                            syn_config=self._synthesis_config(spoken),
                         )
                 self._play(str(wav),stop_event)
         except Exception as e:
@@ -465,18 +486,7 @@ class TTS:
         with self._play_lock:
             if stop_event.is_set(): return
             sd.play(data*vol,sr)
-            while not stop_event.is_set():
-                try:
-                    sd.wait(timeout=50)
-                    stream_getter = getattr(sd, "get_stream", None)
-                    if stream_getter is not None:
-                        if stream_getter() is None:
-                            break
-                except Exception:
-                    break
-            if stop_event.is_set():
-                try: sd.stop()
-                except Exception: pass
+            sd.wait()
     def stop(self):
         self._stop.set()
         with self._windows_process_lock:

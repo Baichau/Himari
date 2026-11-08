@@ -9,7 +9,11 @@ sounddevice>=0.4.6
 numpy
 mss
 Pillow
-pytesseract
+winrt-Windows.Foundation>=3.2.1,<4
+winrt-Windows.Globalization>=3.2.1,<4
+winrt-Windows.Graphics.Imaging>=3.2.1,<4
+winrt-Windows.Media.Ocr>=3.2.1,<4
+winrt-Windows.Storage.Streams>=3.2.1,<4
 pygetwindow
 pyautogui
 psutil

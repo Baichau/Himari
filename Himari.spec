@@ -27,7 +27,15 @@ datas += [
     for name in required_voice_files
 ]
 binaries = []
-hiddenimports = ['PySide6.QtSvg', 'keyboard']
+hiddenimports = [
+    'PySide6.QtSvg',
+    'keyboard',
+    'winrt.windows.foundation',
+    'winrt.windows.globalization',
+    'winrt.windows.graphics.imaging',
+    'winrt.windows.media.ocr',
+    'winrt.windows.storage.streams',
+]
 datas += collect_data_files('_sounddevice_data')
 tmp_ret = collect_all('piper')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

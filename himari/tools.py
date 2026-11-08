@@ -6,7 +6,7 @@ import shutil
 import subprocess
 import webbrowser
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -88,6 +88,30 @@ def _start_menu_app_id(app_id):
         return False
 
 
+def _find_start_menu_app_id(name):
+    if os.name != "nt":
+        return None
+    escaped_name = name.replace("'", "''")
+    script = (
+        "Get-StartApps | Where-Object { $_.Name -ieq "
+        f"'{escaped_name}' }} | Select-Object -First 1 -ExpandProperty AppID"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log.warning("Could not look up Windows Store app %s: %s", name, exc)
+        return None
+    app_id = result.stdout.strip()
+    return app_id if result.returncode == 0 and app_id else None
+
+
 def open_app(name):
     if not _perm("allow_open_app"):
         return "Permission denied: open_app"
@@ -116,8 +140,12 @@ def open_app(name):
     for shortcut_name in shortcut_names:
         if _start_menu_shortcut(shortcut_name):
             return f"Opened {shortcut_name}."
+    for app_name in shortcut_names:
+        app_id = _find_start_menu_app_id(app_name)
+        if app_id and _start_menu_app_id(app_id):
+            return f"Opened {app_name}."
     if alias in {"minecraft", "minecraft launcher"} and _start_menu_app_id(
-        "Microsoft.4297127D64EC_8wekyb3d8bbwe!Minecraft"
+        "Microsoft.4297127D64EC6_8wekyb3d8bbwe!Minecraft"
     ):
         return "Opened Minecraft Launcher."
 
@@ -295,6 +323,58 @@ def write_file(path, content):
         return f"Wrote {len(content)} chars to {path}"
     except (OSError, PermissionError) as e:
         return f"Failed: {e}"
+
+
+def _desktop_directory():
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                desktop, _ = winreg.QueryValueEx(key, "Desktop")
+            return Path(os.path.expandvars(desktop)).resolve()
+        except (OSError, ImportError):
+            pass
+    return (Path.home() / "Desktop").resolve()
+
+
+def write_desktop_file(filename, content):
+    if not isinstance(filename, str) or not filename.strip():
+        return "Choose a filename for the Desktop text file."
+    if not isinstance(content, str):
+        return "Text file content must be a string."
+    if len(content) > 100_000:
+        return "Text is too long for a Desktop text file (maximum 100,000 characters)."
+    filename = filename.strip()
+    if (
+        filename in {".", ".."}
+        or Path(filename).name != filename
+        or PureWindowsPath(filename).name != filename
+        or any(char in filename for char in '<>:"/\\|?*')
+    ):
+        return "Use a simple filename without a folder path or Windows-reserved characters."
+    if Path(filename).suffix.lower() not in {"", ".txt"}:
+        return "This action only creates .txt files on the Desktop."
+    if Path(filename).suffix.lower() != ".txt":
+        filename += ".txt"
+    target = _desktop_directory() / filename
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8", newline="\n") as output:
+            output.write(content)
+        return f"Wrote {len(content)} characters to the Desktop file {filename}."
+    except OSError as exc:
+        log.warning("Could not write Desktop text file %s: %s", target, exc)
+        return f"Could not write the Desktop text file: {exc}"
+
+
+def capture_screen_text():
+    from .screen import analyze
+
+    return f"Text extracted from the primary screen (the screenshot was discarded):\n{analyze()}"
 
 
 def active_window():
@@ -558,10 +638,27 @@ TOOLS = [
      "fn": read_file},
     {"name": "write_file", "confirm": True, "confirm_message": "Allow Himari to write this file?",
      "spec": {"type": "function", "function": {
-         "name": "write_file", "description": "Write text to a file.",
+         "name": "write_file", "description": "Write text to a file inside a folder explicitly allowed in Settings. For a Desktop .txt file, use write_desktop_file.",
          "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                         "required": ["path", "content"]}}},
      "fn": write_file},
+    {"name": "write_desktop_file", "confirm": True,
+     "confirm_message": "Allow Himari to create or replace this .txt file on your Desktop?",
+     "spec": {"type": "function", "function": {
+         "name": "write_desktop_file",
+         "description": "Create or replace a plain text .txt file directly on the user's Desktop. This is limited to Desktop filenames, and every write requires user confirmation.",
+         "parameters": {"type": "object", "properties": {
+             "filename": {"type": "string"},
+             "content": {"type": "string"},
+         }, "required": ["filename", "content"]}}},
+     "fn": write_desktop_file},
+    {"name": "capture_screen_text", "confirm": True,
+     "confirm_message": "Allow Himari to capture the primary screen and extract visible text? The image is discarded immediately after OCR.",
+     "spec": {"type": "function", "function": {
+         "name": "capture_screen_text",
+         "description": "Capture the primary screen once, extract visible text with Windows OCR, and discard the image immediately. Use only when the user asks about their screen or screenshot. Never capture continuously.",
+         "parameters": {"type": "object", "properties": {}}}},
+     "fn": capture_screen_text},
     {"name": "active_window", "confirm": False, "spec": {"type": "function", "function": {
         "name": "active_window", "description": "Get the active window title.",
         "parameters": {"type": "object", "properties": {}}}},

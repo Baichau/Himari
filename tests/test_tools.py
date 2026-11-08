@@ -88,13 +88,52 @@ def test_open_minecraft_launcher_uses_start_menu_shortcut(monkeypatch):
 def test_open_minecraft_launcher_uses_store_app_when_shortcut_is_missing(monkeypatch):
     monkeypatch.setattr(tools, "_perm", lambda name: True)
     monkeypatch.setattr(tools, "_start_menu_shortcut", lambda name: False)
+    monkeypatch.setattr(tools, "_find_start_menu_app_id", lambda name: None)
     monkeypatch.setattr(
         tools,
         "_start_menu_app_id",
-        lambda app_id: app_id == "Microsoft.4297127D64EC_8wekyb3d8bbwe!Minecraft",
+        lambda app_id: app_id == "Microsoft.4297127D64EC6_8wekyb3d8bbwe!Minecraft",
     )
 
     assert tools.open_app("Minecraft Launcher") == "Opened Minecraft Launcher."
+
+
+def test_open_store_apps_by_the_registered_start_app_id(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    monkeypatch.setattr(tools, "_start_menu_shortcut", lambda name: False)
+    monkeypatch.setattr(tools, "_find_start_menu_app_id", lambda name: "Store.App!Application")
+    open_store_app = Mock(return_value=True)
+    monkeypatch.setattr(tools, "_start_menu_app_id", open_store_app)
+
+    assert tools.open_app("Minecraft Launcher") == "Opened Minecraft Launcher."
+    open_store_app.assert_called_once_with("Store.App!Application")
+
+
+def test_write_desktop_file_is_confined_to_a_text_filename(tmp_path, monkeypatch):
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    monkeypatch.setattr(tools, "_desktop_directory", lambda: desktop)
+
+    result = tools.write_desktop_file("notes", "Please remember this.")
+
+    assert result == "Wrote 21 characters to the Desktop file notes.txt."
+    assert (desktop / "notes.txt").read_text(encoding="utf-8") == "Please remember this."
+    assert "without a folder path" in tools.write_desktop_file("..\\outside.txt", "no")
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_write_desktop_file_is_registered_with_user_confirmation():
+    handler = next(item for item in tools.TOOLS if item["name"] == "write_desktop_file")
+
+    assert handler["confirm"] is True
+    assert handler["fn"] is tools.write_desktop_file
+
+
+def test_screen_capture_tool_requires_confirmation():
+    handler = next(item for item in tools.TOOLS if item["name"] == "capture_screen_text")
+
+    assert handler["confirm"] is True
+    assert "discarded immediately" in handler["confirm_message"]
 
 
 def test_launch_game_uses_exact_steam_title():
