@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np, sounddevice as sd
 import emoji
 from .config import load, save, APP_DIR
+from .paths import resource_dir
 log=logging.getLogger("himari.voice")
 _UNSET = object()
 DEFAULT_TTS_VOICES = {"en": "en_US-amy-medium"}
@@ -78,28 +79,43 @@ def _spoken_language(text, default="en"):
 
 def _bundled_voice_dir():
     if getattr(sys, "frozen", False):
-        return Path(sys._MEIPASS) / "voices"
+        return resource_dir() / "voices"
     return Path(__file__).resolve().parents[1] / "models" / "piper-voices"
+
+
+def _is_local_whisper_model(path):
+    return (path / "model.bin").is_file() and (path / "config.json").is_file()
 
 
 def _cached_stt_model(name):
     local_path = Path(name).expanduser()
-    if local_path.is_dir():
+    if local_path.is_dir() and _is_local_whisper_model(local_path):
         return str(local_path.resolve())
-    bundled_path = Path(__file__).resolve().parents[1] / "models" / name
-    if (bundled_path / "model.bin").is_file() and (bundled_path / "config.json").is_file():
-        return str(bundled_path)
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(resource_dir() / "models")
+    roots.append(Path(__file__).resolve().parents[1] / "models")
+    for root in roots:
+        bundled_path = root / name
+        if _is_local_whisper_model(bundled_path):
+            return str(bundled_path.resolve())
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
     except ImportError:
         return None
 
-    snapshots = Path(HF_HUB_CACHE) / f"models--Systran--faster-whisper-{name}" / "snapshots"
-    if not snapshots.is_dir():
-        return None
-    for snapshot in sorted(snapshots.iterdir(), reverse=True):
-        if snapshot.is_dir() and (snapshot / "model.bin").is_file():
-            return name
+    cache = Path(HF_HUB_CACHE)
+    repositories = (
+        "models--Systran--faster-whisper-",
+        "models--mobiuslabsgmbh--faster-whisper-",
+    )
+    for repository in repositories:
+        snapshots = cache / f"{repository}{name}" / "snapshots"
+        if not snapshots.is_dir():
+            continue
+        for snapshot in sorted(snapshots.iterdir(), reverse=True):
+            if snapshot.is_dir() and _is_local_whisper_model(snapshot):
+                return str(snapshot.resolve())
     return None
 
 

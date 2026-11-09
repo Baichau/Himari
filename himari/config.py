@@ -1,30 +1,84 @@
-import json, os, copy, sys
+import copy
+import json
+import os
 from pathlib import Path
-APP_DIR=Path(os.environ.get("HIMARI_HOME", Path.home()/".himari"))
-CFG=APP_DIR/"config.json"
-RESOURCE_DIR=Path(getattr(sys,"_MEIPASS",Path(__file__).parent.parent))
-DEFAULT=json.loads((RESOURCE_DIR/"config.example.json").read_text(encoding="utf-8"))
+
+from .paths import resource_dir, user_data_dir
+
+APP_DIR = user_data_dir()
+CFG = APP_DIR / "config.json"
+RESOURCE_DIR = resource_dir()
+DEFAULT_CONFIG_PATH = RESOURCE_DIR / "config.example.json"
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def _read_defaults():
+    try:
+        return json.loads(DEFAULT_CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(
+            f"Could not load the packaged configuration template "
+            f"'{DEFAULT_CONFIG_PATH}': {exc}"
+        ) from exc
+
+
+DEFAULT = _read_defaults()
+
+
 def _merge(base, override):
-    for k,v in override.items():
-        if isinstance(v,dict) and isinstance(base.get(k),dict): _merge(base[k],v)
-        else: base[k]=v
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge(base[key], value)
+        else:
+            base[key] = value
     return base
+
+
 def load():
-    APP_DIR.mkdir(parents=True,exist_ok=True)
-    if not CFG.exists(): CFG.write_text(json.dumps(DEFAULT,indent=2),encoding="utf-8")
-    try: user=json.loads(CFG.read_text(encoding="utf-8"))
-    except Exception: user={}
-    return _merge(copy.deepcopy(DEFAULT),user)
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    if not CFG.exists():
+        save(copy.deepcopy(DEFAULT))
+    try:
+        user = json.loads(CFG.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"Could not read settings file '{CFG}': {exc}") from exc
+    if not isinstance(user, dict):
+        raise ConfigError(f"Settings file '{CFG}' must contain a JSON object.")
+    return _merge(copy.deepcopy(DEFAULT), user)
+
+
 def save(cfg):
-    APP_DIR.mkdir(parents=True,exist_ok=True)
-    CFG.write_text(json.dumps(cfg,indent=2),encoding="utf-8")
+    if not isinstance(cfg, dict):
+        raise TypeError("Settings must be a JSON object.")
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = CFG.with_suffix(".json.tmp")
+    try:
+        temp_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        os.replace(temp_path, CFG)
+    except OSError:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
 def get(*keys, default=None):
-    c=load()
-    for k in keys:
-        if not isinstance(c,dict) or k not in c: return default
-        c=c[k]
-    return c
-def set_value(keys,value):
-    c=load(); d=c
-    for k in keys[:-1]: d=d.setdefault(k,{})
-    d[keys[-1]]=value; save(c)
+    config = load()
+    for key in keys:
+        if not isinstance(config, dict) or key not in config:
+            return default
+        config = config[key]
+    return config
+
+
+def set_value(keys, value):
+    config = load()
+    node = config
+    for key in keys[:-1]:
+        node = node.setdefault(key, {})
+    node[keys[-1]] = value
+    save(config)

@@ -25,6 +25,51 @@ def test_stream_chat_disables_hidden_qwen_thinking_output():
     assert client.chat.call_args.kwargs["think"] is False
 
 
+def test_model_status_uses_a_short_timeout_and_returns_installed_tags(monkeypatch):
+    client = Mock()
+    client.list.return_value = {
+        "models": [{"name": "qwen3:8b"}, {"name": "llama3.2:3b"}],
+    }
+    llm = LLM()
+    client_factory = Mock(return_value=client)
+    monkeypatch.setattr(llm, "client", client_factory)
+
+    models, error = llm.model_status()
+
+    assert models == ["qwen3:8b", "llama3.2:3b"]
+    assert error is None
+    client_factory.assert_called_once_with(timeout=5)
+
+
+def test_model_status_reports_unreachable_ollama(monkeypatch):
+    llm = LLM()
+    monkeypatch.setattr(
+        llm,
+        "client",
+        Mock(side_effect=RuntimeError("connection refused")),
+    )
+
+    models, error = llm.model_status()
+
+    assert models == []
+    assert error == "connection refused"
+
+
+def test_missing_ollama_model_error_includes_manual_install_command():
+    client = Mock()
+    client.chat.side_effect = RuntimeError("model 'qwen3:8b' not found")
+    llm = LLM()
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.load", return_value={"ollama": {
+             "chat_model": "qwen3:8b",
+             "temperature": 0.7,
+             "timeout_seconds": 180,
+             "host": "http://localhost:11434",
+         }}), \
+         pytest.raises(LLMError, match=r"ollama pull qwen3:8b"):
+        llm.stream_chat([])
+
+
 def test_confirmation_required_tools_fail_closed_without_callback():
     action = Mock(return_value="executed")
     client = Mock()

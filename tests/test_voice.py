@@ -114,6 +114,29 @@ def test_stt_finds_bundled_model_and_prefers_it_to_the_english_fallback(tmp_path
     assert voice._preferred_stt_model() == str(model_dir)
 
 
+def test_stt_finds_local_mobiuslabsgmbh_snapshot_without_network(tmp_path, monkeypatch):
+    cache = tmp_path / "hub"
+    snapshot = (
+        cache / "models--mobiuslabsgmbh--faster-whisper-large-v3-turbo"
+        / "snapshots" / "local-revision"
+    )
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.bin").touch()
+    (snapshot / "config.json").touch()
+    constants = SimpleNamespace(HF_HUB_CACHE=str(cache))
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub.constants",
+        constants,
+    )
+    monkeypatch.setattr(voice, "load", lambda: {
+        "voice": {"stt_model": "large-v3-turbo", "recognition_language": "auto"},
+    })
+    monkeypatch.setattr(voice, "_bundled_voice_dir", lambda: tmp_path / "voices")
+
+    assert voice._cached_stt_model("large-v3-turbo") == str(snapshot.resolve())
+
+
 def test_stt_prefers_bundled_multilingual_model_over_saved_english_model(tmp_path, monkeypatch):
     module_dir = tmp_path / "himari"
     module_dir.mkdir()

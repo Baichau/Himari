@@ -9,17 +9,38 @@ class LLM:
         self.tools=tools or []
     @property
     def cfg(self): return load()["ollama"]
-    def client(self):
+    def client(self, timeout=None):
         cfg=self.cfg
-        return ollama.Client(host=cfg["host"],timeout=cfg.get("timeout_seconds",180))
-    def ping(self):
+        return ollama.Client(
+            host=cfg["host"],
+            timeout=timeout if timeout is not None else cfg.get("timeout_seconds",180),
+        )
+    def model_status(self):
         try:
-            self.client().list(); return True
+            response = self.client(timeout=5).list()
+            raw_models = (
+                response.get("models", [])
+                if isinstance(response, dict)
+                else getattr(response, "models", [])
+            )
+            names = []
+            for model in raw_models:
+                if isinstance(model, dict):
+                    name = model.get("name") or model.get("model")
+                else:
+                    name = getattr(model, "model", None) or getattr(model, "name", None)
+                if name:
+                    names.append(str(name))
+            return names, None
         except Exception as e:
-            log.warning("Ollama ping failed: %s",e); return False
+            log.warning("Ollama model check failed: %s",e)
+            return [], str(e)
+    def ping(self):
+        _, error = self.model_status()
+        return error is None
     def list_models(self):
-        try: return [m["name"] for m in self.client().list().get("models",[])]
-        except Exception: return []
+        models, _ = self.model_status()
+        return models
     def stream_chat(self, messages, on_token=None, on_tool=None, confirm=None):
         cfg=self.cfg
         payload={"model":cfg["chat_model"],"messages":messages,"stream":True,
@@ -28,7 +49,17 @@ class LLM:
         client=self.client()
         for round_index in range(MAX_TOOL_ROUNDS+1):
             try: stream=client.chat(**payload)
-            except Exception as e: raise LLMError(f"Cannot reach Ollama: {e}") from e
+            except Exception as e:
+                message = str(e)
+                if "model" in message.lower() and any(
+                    term in message.lower()
+                    for term in ("not found", "404", "does not exist")
+                ):
+                    raise LLMError(
+                        f"Ollama does not have '{cfg['chat_model']}' installed. "
+                        f"Install it manually with: ollama pull {cfg['chat_model']}"
+                    ) from e
+                raise LLMError(f"Cannot reach Ollama: {e}") from e
             content=""; tool_calls=[]
             for chunk in stream:
                 m=chunk.message

@@ -170,43 +170,85 @@ def open_app(name):
     return f"Could not find '{requested}'. Try an installed Start Menu app name or full path."
 
 
+
 def open_url(url):
     if not _perm("allow_open_url"):
         return "Permission denied: open_url"
+
+    if not isinstance(url, str) or not url.strip():
+        return "Please provide a website URL."
+
     url = url.strip()
+
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "Only valid HTTP or HTTPS website URLs can be opened."
+
+    if any(ch in url for ch in "\r\n\x00"):
+        return "The URL contains invalid control characters."
+
     try:
         opened = webbrowser.open(url)
     except Exception as e:
-        return f"Failed to open {url}: {e}"
+        return f"Failed to open website: {e}"
+
     return f"Opened {url}" if opened else f"Could not open {url}"
 
 
+
+
 def close_app(name):
+    """Ask a matching window to close gracefully."""
     if not _perm("allow_open_app"):
-        return "Permission denied: open_app"
+        return "Permission denied: close_app"
+
     requested = (name or "").strip()
+
     if not requested:
         return "Tell me which app to close."
+
     try:
         import pygetwindow as gw
-        windows = gw.getAllTitles()
-        for title in windows:
-            if title and requested.casefold() in title.casefold():
-                w = gw.getWindowsWithTitle(title)
-                if w:
-                    w[0].close()
-                    return f"Closed '{title}'."
-    except Exception:
-        pass
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/F", "/FI", f"WINDOWTITLE eq {requested}"], capture_output=True, text=True, check=False)
-            return f"Attempted to close apps matching '{requested}'."
+
+        matches = [
+            title for title in gw.getAllTitles()
+            if title and requested.casefold() in title.casefold()
+        ]
+
+        if not matches:
+            return f"Could not find an open window matching '{requested}'."
+
+        if len(matches) > 1:
+            return (
+                "More than one window matches: "
+                + "; ".join(matches[:8])
+                + ". Please specify a more exact window title."
+            )
+
+        windows = gw.getWindowsWithTitle(matches[0])
+
+        if not windows:
+            return f"The window '{matches[0]}' is no longer available."
+
+        windows[0].close()
+
+        return (
+            f"Closed '{matches[0]}' via a normal close request. "
+            "The application may ask you to save changes."
+        )
+
     except Exception as exc:
-        return f"Could not close '{requested}': {exc}"
-    return f"Could not find an open app matching '{requested}'."
+        log.warning(
+            "Graceful close request failed for %s: %s",
+            requested,
+            exc,
+        )
+        return f"Could not send a normal close request: {exc}"
+
 
 
 def play_music(query):
@@ -372,12 +414,16 @@ def write_desktop_file(filename, content):
 
 
 def capture_screen_text():
+    if not _perm("allow_screen_capture"):
+        return "Permission denied: screen capture is disabled in Settings."
     from .screen import analyze
 
     return f"Text extracted from the primary screen (the screenshot was discarded):\n{analyze()}"
 
 
 def active_window():
+    if not _perm("allow_active_window"):
+        return "Permission denied: active-window awareness is disabled in Settings."
     try:
         import pygetwindow as gw
         window = gw.getActiveWindow()
@@ -386,37 +432,53 @@ def active_window():
         return f"Failed: {e}"
 
 
+_MEDIA_KEYS = {
+    "play_pause": 0xB3,
+    "next": 0xB0,
+    "previous": 0xB1,
+    "stop": 0xB2,
+}
+
+
+def media_control(action):
+    if not _perm("allow_media_control"):
+        return "Permission denied: media controls are disabled in Settings."
+    if not isinstance(action, str) or action not in _MEDIA_KEYS:
+        return "Unsupported media action. Choose play_pause, next, previous, or stop."
+    if os.name != "nt":
+        return "Windows media controls are only available on Windows."
+
+    try:
+        import ctypes
+
+        key = _MEDIA_KEYS[action]
+        user32 = ctypes.windll.user32
+        user32.keybd_event(key, 0, 0, 0)
+        user32.keybd_event(key, 0, 0x0002, 0)
+    except (AttributeError, OSError) as exc:
+        log.warning("Windows media control failed for %s: %s", action, exc)
+        return f"Could not send the Windows media command: {exc}"
+
+    return (
+        f"Sent the {action.replace('_', '/')} command to the active Windows "
+        "media session. Himari cannot confirm which app handled it or the playback state."
+    )
+
+
+
 def _safe_command_list(cmd):
-    if isinstance(cmd, str):
-        parts = shlex.split(cmd, posix=os.name != "nt")
-    elif isinstance(cmd, (list, tuple)):
-        parts = [str(part) for part in cmd]
-    else:
-        raise TypeError("Command must be a string or list of arguments.")
-    if not parts:
-        raise ValueError("Command is empty.")
-    allowlist = {
-        "dir", "type", "echo", "where", "whoami", "hostname", "ipconfig", "tasklist", "taskkill",
-        "git", "python", "py", "cmd", "powershell", "powershell.exe", "wmic",
-        "start", "notepad", "explorer", "reg", "sc", "netstat", "systeminfo",
-    }
-    exe = Path(parts[0]).name.lower()
-    if exe not in allowlist:
-        raise PermissionError(f"Command not allowed: {parts[0]}")
-    return parts
+    raise PermissionError(
+        "Arbitrary shell execution is disabled for safety. "
+        "Use a dedicated Himari tool instead."
+    )
 
 
 def run_command(cmd):
-    if not _perm("allow_run_command"):
-        return "Permission denied: run_command is disabled by default."
-    try:
-        parts = _safe_command_list(cmd)
-        result = subprocess.run(parts, capture_output=True, text=True, timeout=20, shell=False)
-        return (result.stdout + result.stderr)[:4000] or "(no output)"
-    except (PermissionError, ValueError, TypeError) as e:
-        return f"Failed: {e}"
-    except Exception as e:
-        return f"Failed: {e}"
+    return (
+        "Arbitrary shell commands are disabled. "
+        "Himari uses dedicated, permission-checked tools instead."
+    )
+
 
 
 def search_web(query):
@@ -618,10 +680,33 @@ TOOLS = [
         "name": "search_youtube", "description": "Open YouTube search results for a query.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
      "fn": search_youtube},
-    {"name": "close_app", "confirm": False, "spec": {"type": "function", "function": {
-        "name": "close_app", "description": "Close an open desktop app if it matches the provided name.",
-        "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
-     "fn": close_app},
+
+    {
+        "name": "close_app",
+        "confirm": True,
+        "confirm_message": (
+            "Allow Himari to send a normal close request to this "
+            "application? Unsaved work may trigger a save dialog."
+        ),
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "close_app",
+                "description": (
+                    "Gracefully request that a specific open desktop "
+                    "window closes. Never force-terminate processes."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"}
+                    },
+                    "required": ["name"]
+                }
+            }
+        },
+        "fn": close_app
+    },
     {"name": "list_project_files", "confirm": True, "confirm_message": "Allow Himari to inspect this project folder?",
      "spec": {"type": "function", "function": {
          "name": "list_project_files", "description": "List project files while ignoring common build/cache folders.",
@@ -668,4 +753,37 @@ TOOLS = [
          "name": "run_command", "description": "Run a shell command (disabled by default).",
          "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]}}},
      "fn": run_command},
+
+    {
+        "name": "media_control",
+        "confirm": False,
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "media_control",
+                "description": (
+                    "Control the active Windows media session. "
+                    "Supports play_pause, next, previous and stop. "
+                    "May control Spotify or another active media app."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": [
+                                "play_pause",
+                                "next",
+                                "previous",
+                                "stop"
+                            ]
+                        }
+                    },
+                    "required": ["action"]
+                }
+            }
+        },
+        "fn": media_control
+    },
+
 ]

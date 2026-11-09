@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 from unittest.mock import MagicMock, Mock, patch
+from types import SimpleNamespace
 from urllib.error import URLError
 
 import pytest
@@ -224,6 +225,67 @@ def test_close_app_uses_window_title_match():
          patch("pygetwindow.getWindowsWithTitle", return_value=[type("W", (), {"close": lambda self: None})()]):
         result = tools.close_app("spotify")
     assert "Closed 'Spotify'" in result
+
+
+def test_close_app_requests_a_graceful_close(monkeypatch):
+    class Window:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    monkeypatch.setattr(tools, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "pygetwindow",
+        SimpleNamespace(
+            getAllTitles=lambda: ["Spotify"],
+            getWindowsWithTitle=lambda title: [Window()],
+        ),
+    )
+
+    result = tools.close_app("Spotify")
+
+    assert "normal close request" in result
+    assert "save changes" in result
+
+
+def test_media_control_is_permission_gated(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: False)
+
+    assert "disabled in Settings" in tools.media_control("play_pause")
+
+
+def test_media_control_rejects_unrecognized_actions(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+
+    assert "Unsupported media action" in tools.media_control("launch_process")
+
+
+def test_media_control_sends_a_windows_media_key(monkeypatch):
+    sent = []
+    user32 = SimpleNamespace(keybd_event=lambda *args: sent.append(args))
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    monkeypatch.setattr(tools, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setitem(__import__("sys").modules, "ctypes", SimpleNamespace(
+        windll=SimpleNamespace(user32=user32),
+    ))
+
+    result = tools.media_control("next")
+
+    assert sent == [(0xB0, 0, 0, 0), (0xB0, 0, 0x0002, 0)]
+    assert "cannot confirm which app handled it" in result
+
+
+def test_screen_capture_tool_respects_settings_permission(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: False)
+
+    assert "disabled in Settings" in tools.capture_screen_text()
+
+
+def test_active_window_detection_is_disabled_without_permission(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: False)
+
+    assert "disabled in Settings" in tools.active_window()
 
 
 def test_list_project_files_ignores_build_dirs(tmp_path):

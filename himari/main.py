@@ -1,2 +1,5 @@
-from .ui import run
-if __name__=="__main__": run()
+from .bootstrap import main
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

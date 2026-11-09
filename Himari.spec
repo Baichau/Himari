@@ -1,66 +1,80 @@
 # -*- mode: python ; coding: utf-8 -*-
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files
-from PyInstaller.utils.hooks import collect_all
 
-try:
-    import emoji
-except ImportError as exc:
-    raise RuntimeError(
-        "The required 'emoji' package is missing. Run setup_windows.bat before building."
-    ) from exc
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
-datas = [('config.example.json', '.'), ('THIRD_PARTY_NOTICES.txt', '.')]
-speech_model = Path(SPECPATH) / 'models' / 'large-v3-turbo'
-if (speech_model / 'model.bin').is_file():
-    required_model_files = [
-        'config.json', 'model.bin', 'preprocessor_config.json',
-        'tokenizer.json', 'vocabulary.json',
-    ]
-    missing_model_files = [name for name in required_model_files if not (speech_model / name).is_file()]
-    if missing_model_files:
-        raise FileNotFoundError(f"Incomplete bundled speech model: {', '.join(missing_model_files)}")
-    datas += [
-        (str(speech_model / name), 'models/large-v3-turbo')
-        for name in required_model_files
-    ]
-piper_voice = Path(SPECPATH) / 'models' / 'piper-voices'
-required_voice_files = ['en_US-amy-medium.onnx', 'en_US-amy-medium.onnx.json']
-missing_voice_files = [name for name in required_voice_files if not (piper_voice / name).is_file()]
-if missing_voice_files:
-    raise FileNotFoundError(f"Incomplete bundled English voice: {', '.join(missing_voice_files)}")
-datas += [
-    (str(piper_voice / name), 'voices')
-    for name in required_voice_files
+ROOT = Path(SPECPATH).resolve()
+datas = [
+    (str(ROOT / "config.example.json"), "."),
+    (str(ROOT / "THIRD_PARTY_NOTICES.txt"), "."),
 ]
+
+avatar_dir = ROOT / "himari" / "avatar_assets"
+if avatar_dir.is_dir():
+    datas.extend(
+        (str(asset), "himari/avatar_assets")
+        for asset in sorted(avatar_dir.glob("*.png"))
+    )
+
+models_dir = ROOT / "models"
+if models_dir.is_dir():
+    for model_dir in sorted(models_dir.iterdir()):
+        if not model_dir.is_dir() or model_dir.name == "piper-voices":
+            continue
+        if not (model_dir / "model.bin").is_file() or not (model_dir / "config.json").is_file():
+            raise FileNotFoundError(
+                f"Incomplete Faster-Whisper model directory: {model_dir}"
+            )
+        datas.extend(
+            (str(model_file), f"models/{model_dir.name}")
+            for model_file in sorted(model_dir.rglob("*"))
+            if model_file.is_file()
+        )
+
+voice_dir = models_dir / "piper-voices"
+if voice_dir.is_dir():
+    voice_models = sorted(voice_dir.glob("*.onnx"))
+    if not voice_models:
+        raise FileNotFoundError(
+            f"No Piper .onnx voice models found in {voice_dir}"
+        )
+    for model in voice_models:
+        metadata = model.with_suffix(model.suffix + ".json")
+        if not metadata.is_file():
+            raise FileNotFoundError(
+                f"Missing Piper voice metadata file: {metadata}"
+            )
+        datas.append((str(model), "voices"))
+        datas.append((str(metadata), "voices"))
+
 binaries = []
 hiddenimports = [
-    'PySide6.QtSvg',
-    'keyboard',
-    'winrt.windows.foundation',
-    'winrt.windows.globalization',
-    'winrt.windows.graphics.imaging',
-    'winrt.windows.media.ocr',
-    'winrt.windows.storage.streams',
+    "keyboard",
+    "winrt.windows.foundation",
+    "winrt.windows.globalization",
+    "winrt.windows.graphics.imaging",
+    "winrt.windows.media.ocr",
+    "winrt.windows.storage.streams",
 ]
-datas += collect_data_files('_sounddevice_data')
-tmp_ret = collect_all('piper')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('emoji')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('faster_whisper')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('ctranslate2')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('onnxruntime')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('av')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
+datas += collect_data_files("_sounddevice_data")
+for package in (
+    "piper",
+    "emoji",
+    "faster_whisper",
+    "ctranslate2",
+    "onnxruntime",
+    "av",
+    "winrt",
+):
+    collected_datas, collected_binaries, collected_imports = collect_all(package)
+    datas += collected_datas
+    binaries += collected_binaries
+    hiddenimports += collected_imports
 
 a = Analysis(
-    ['himari_launcher.py'],
-    pathex=[],
+    [str(ROOT / "himari_launcher.py")],
+    pathex=[str(ROOT)],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -73,17 +87,18 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+# ONEFILE: binaries and datas go inside the EXE, and there is no COLLECT block.
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.datas,
     [],
-    name='Himari',
+    name="Himari",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,

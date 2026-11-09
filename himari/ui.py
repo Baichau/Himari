@@ -2,12 +2,12 @@ import sys, threading, logging
 from datetime import datetime
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QTextEdit,
  QLineEdit,QPushButton,QLabel,QListWidget,QCheckBox,QComboBox,QSlider,QTabWidget,QInputDialog,QFileDialog,
- QMessageBox,QSystemTrayIcon,QMenu)
-from PySide6.QtCore import Qt, Signal, QTimer, QByteArray
+ QMessageBox,QSystemTrayIcon,QMenu,QScrollArea)
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QTextCursor
-from PySide6.QtSvg import QSvgRenderer
 from .config import load, save
 from . import db, persona
+from .avatar import AvatarWidget, FloatingAvatarWindow
 from .llm import LLM
 from .voice import STT, TTS, Mic, WakeWordMonitor, correct_known_voice_commands
 from .screen import analyze
@@ -16,6 +16,7 @@ log=logging.getLogger("himari.ui")
 class UI(QMainWindow):
     token=Signal(str); status=Signal(str); done=Signal(str); tool=Signal(str)
     failed=Signal(str); voice_result=Signal(str); screen_result=Signal(str,str); screen_error=Signal(str)
+    ollama_checked=Signal(object)
     hotkey_pressed=Signal(); screen_hotkey_pressed=Signal(); confirmation_requested=Signal(object)
     auto_stop_requested=Signal(); wake_word_detected_signal=Signal(str)
     def __init__(self):
@@ -30,12 +31,14 @@ class UI(QMainWindow):
         self._streamed_response = ""
         self.hotkey_error = None
         self.screen_hotkey_error = None
+        self._ollama_check_running = False
         self.wake_word_monitor = WakeWordMonitor(
             on_detect=self.wake_word_detected_signal.emit,
             on_error=self.status.emit,
         )
         self.wake_word_status = QLabel("Wake-word: idle")
         self.wake_word_status.setStyleSheet("color: #8b8b8b;")
+        self.floating_avatar = FloatingAvatarWindow(self)
         self.tray=None
         self.capture_tray_action=None
         self._allow_quit = False
@@ -49,35 +52,20 @@ class UI(QMainWindow):
         self.confirmation_requested.connect(self._confirm_tool)
         self.auto_stop_requested.connect(self._auto_stop_mic)
         self.wake_word_detected_signal.connect(self._wake_word_detected)
+        self.ollama_checked.connect(self._apply_ollama_status)
         tabs=QTabWidget(); self.setCentralWidget(tabs)
         # Chat tab
         chat=QWidget(); v=QVBoxLayout(chat)
         header=QHBoxLayout()
-        avatar=QLabel(); avatar.setFixedSize(88,88)
-        svg=b"""<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
-        <defs><linearGradient id="bg" x2="0" y2="1"><stop stop-color="#ffe4f1"/><stop offset="1" stop-color="#f8b8d4"/></linearGradient>
-        <linearGradient id="hair" x2="0" y2="1"><stop stop-color="#81466f"/><stop offset="1" stop-color="#422b59"/></linearGradient></defs>
-        <circle cx="64" cy="64" r="62" fill="url(#bg)"/>
-        <path d="M25 121V96c0-22 16-33 39-33s39 11 39 33v25z" fill="#76528c"/>
-        <path d="M35 64C24 39 37 15 64 14c28-1 42 21 32 52l-7 34H39z" fill="url(#hair)"/>
-        <ellipse cx="64" cy="56" rx="26" ry="32" fill="#ffe0d2"/>
-        <path d="M38 52c0-26 13-38 30-36 13 1 22 11 23 25-11-2-17-10-19-17-7 13-19 20-34 21z" fill="url(#hair)"/>
-        <path d="M40 43c7-4 14-4 20 0-5 3-10 4-20 4m28-4c7-4 14-3 20 1-7 3-13 3-20 1" fill="#ffe0d2"/>
-        <ellipse cx="51" cy="56" rx="5" ry="7" fill="#573958"/><ellipse cx="77" cy="56" rx="5" ry="7" fill="#573958"/>
-        <circle cx="53" cy="54" r="2" fill="white"/><circle cx="79" cy="54" r="2" fill="white"/>
-        <path d="M60 72q4 4 8 0" fill="none" stroke="#c96d83" stroke-width="2" stroke-linecap="round"/>
-        <path d="M30 33l-5-13 14 5 7-10 7 15m30-13 9-9 3 15 13 4-12 9" fill="#e88bb2" stroke="#81466f" stroke-width="3" stroke-linejoin="round"/>
-        <path d="M49 89l15 11 15-11-4 32H53z" fill="#fff1f7"/>
-        <path d="M42 121l8-21 14 10 14-10 8 21" fill="#a878a9"/>
-        </svg>"""
-        pixmap=QPixmap(avatar.size()); pixmap.fill(Qt.transparent)
-        painter=QPainter(pixmap); QSvgRenderer(QByteArray(svg)).render(painter); painter.end()
-        avatar.setPixmap(pixmap)
+        self.avatar=AvatarWidget(self); self.avatar.setFixedSize(88,88)
         title=QVBoxLayout()
         name=QLabel("Himari ひまり"); name.setStyleSheet("font-size: 22px; font-weight: 700; color: #b45182;")
         tagline=QLabel("Your local desktop companion"); tagline.setStyleSheet("color: #806b7c;")
         title.addWidget(name); title.addWidget(tagline); title.addStretch()
-        header.addWidget(avatar); header.addLayout(title); header.addStretch(); v.addLayout(header)
+        self.floating_avatar_btn=QPushButton("Floating avatar")
+        self.floating_avatar_btn.clicked.connect(self.toggle_floating_avatar)
+        header.addWidget(self.avatar); header.addLayout(title); header.addStretch()
+        header.addWidget(self.floating_avatar_btn); v.addLayout(header)
         self.chat=QTextEdit(); self.chat.setReadOnly(True)
         self.chat.setFont(QFont("Segoe UI",load()["ui"].get("font_size",14)))
         self.avatar_state = QLabel("● Idle")
@@ -104,21 +92,49 @@ class UI(QMainWindow):
         self.activity_list=QListWidget(); activity_layout.addWidget(self.activity_list)
         tabs.addTab(activity_tab,"Activity")
         # Memory tab
-        mem=QWidget(); mv=QVBoxLayout(mem); self.mem_list=QListWidget(); mv.addWidget(self.mem_list)
+        mem=QWidget(); mv=QVBoxLayout(mem)
+        self.memory_search=QLineEdit()
+        self.memory_search.setPlaceholderText("Search saved memories")
+        self.memory_search.textChanged.connect(self.refresh_mem)
+        mv.addWidget(self.memory_search)
+        self.mem_list=QListWidget(); mv.addWidget(self.mem_list)
         mrow=QHBoxLayout()
         add=QPushButton("Add"); add.clicked.connect(self.add_mem)
         edit=QPushButton("Edit"); edit.clicked.connect(self.edit_mem)
         dele=QPushButton("Delete"); dele.clicked.connect(self.del_mem)
         for b in [add,edit,dele]: mrow.addWidget(b)
-        mv.addLayout(mrow); tabs.addTab(mem,"Memory")
+        mv.addLayout(mrow)
+        mv.addWidget(QLabel("Memory suggestions (review before saving):"))
+        self.suggestion_list=QListWidget(); mv.addWidget(self.suggestion_list)
+        suggestion_row=QHBoxLayout()
+        approve=QPushButton("Approve suggestion")
+        approve.clicked.connect(self.approve_memory_suggestion)
+        reject=QPushButton("Reject suggestion")
+        reject.clicked.connect(self.reject_memory_suggestion)
+        suggestion_row.addWidget(approve); suggestion_row.addWidget(reject)
+        mv.addLayout(suggestion_row); tabs.addTab(mem,"Memory")
         # Settings tab
         st=QWidget(); sv=QVBoxLayout(st)
         self.cb_store=QCheckBox("Store conversations locally"); self.cb_store.setChecked(load()["privacy"]["store_conversations"])
+        self.cb_auto_memory=QCheckBox("Create pending memory suggestions on explicit requests")
+        self.cb_auto_memory.setChecked(load()["privacy"].get("auto_memory", True))
         self.cb_apps=QCheckBox("Allow opening apps and Steam games"); self.cb_apps.setChecked(load()["permissions"]["allow_open_app"])
         self.cb_web=QCheckBox("Allow opening websites"); self.cb_web.setChecked(load()["permissions"]["allow_open_url"])
         self.cb_research=QCheckBox("Allow background web research (sends search terms to DuckDuckGo; does not open a browser)")
         self.cb_research.setChecked(load()["permissions"].get("allow_web_research", True))
-        self.cb_cmd=QCheckBox("Allow shell commands (dangerous)"); self.cb_cmd.setChecked(load()["permissions"]["allow_run_command"])
+        self.cb_screen=QCheckBox("Allow one-time screen capture (asks for confirmation each time)")
+        self.cb_screen.setChecked(load()["permissions"].get("allow_screen_capture", True))
+        self.cb_active_window=QCheckBox("Allow requested active-window detection")
+        self.cb_active_window.setChecked(load()["permissions"].get("allow_active_window", False))
+        self.cb_media=QCheckBox("Allow Windows media controls (may affect the active media app)")
+        self.cb_media.setChecked(load()["permissions"].get("allow_media_control", False))
+        self.cb_cmd=QCheckBox("Allow shell commands (disabled for safety)")
+        self.cb_cmd.setChecked(False)
+        self.cb_cmd.setEnabled(False)
+        self.cb_cmd.setToolTip(
+            "Himari uses dedicated permission-checked tools "
+            "instead of arbitrary shell execution."
+        )
         self.cb_write=QCheckBox("Allow file writes"); self.cb_write.setChecked(load()["permissions"]["allow_write_file"])
         self.cb_wake=QCheckBox("Enable wake-word listening (Himari)"); self.cb_wake.setChecked(load()["voice"].get("wake_word_enabled",False))
         self.cb_wake.toggled.connect(self._toggle_wake_word)
@@ -156,8 +172,10 @@ class UI(QMainWindow):
         self.voice_box.addItems(available_voices or [configured_voice or "en_US-amy-medium"])
         if configured_voice in [self.voice_box.itemText(i) for i in range(self.voice_box.count())]:
             self.voice_box.setCurrentText(configured_voice)
-        self.model_box=QComboBox(); self.model_box.addItems(self.llm.list_models() or ["qwen3:8b"])
-        self.model_box.setCurrentText(load()["ollama"]["chat_model"])
+        self.model_box=QComboBox()
+        configured_model=load()["ollama"]["chat_model"]
+        self.model_box.addItems(dict.fromkeys(["qwen3:8b",configured_model]))
+        self.model_box.setCurrentText(configured_model)
         self.lang_box=QComboBox()
         self.lang_box.addItem("Automatic", "auto")
         self.lang_box.addItem("English", "en")
@@ -173,7 +191,9 @@ class UI(QMainWindow):
         self.screen_hotkey.textChanged.connect(
             lambda key:self.analyze_btn.setText(f"📷 Capture Screen ({key.strip().upper() or 'F10'})")
         )
-        for w in [self.cb_store,self.cb_apps,self.cb_web,self.cb_research,self.cb_cmd,self.cb_write,self.cb_wake,
+        for w in [self.cb_store,self.cb_auto_memory,self.cb_apps,self.cb_web,self.cb_research,self.cb_screen,
+                  self.cb_active_window,self.cb_media,
+                  self.cb_cmd,self.cb_write,self.cb_wake,
                   self.cb_always_on_top,self.cb_minimize_to_tray,
                   QLabel("Folders available to file tools:"),self.allowed_folders]: sv.addWidget(w)
         sv.addLayout(folder_row)
@@ -185,7 +205,9 @@ class UI(QMainWindow):
                   QLabel("Chat model:"),self.model_box,
                   QLabel("TTS volume:"),self.vol,QLabel("Push-to-talk key:"),self.hotkey,
                   QLabel("Global screen-capture key:"),self.screen_hotkey]: sv.addWidget(w)
-        sv.addStretch(); tabs.addTab(st,"Settings")
+        sv.addStretch()
+        settings_scroll=QScrollArea(); settings_scroll.setWidgetResizable(True)
+        settings_scroll.setWidget(st); tabs.addTab(settings_scroll,"Settings")
         self.refresh_mem()
         self.refresh_actions()
         QTimer.singleShot(300,self.check)
@@ -244,7 +266,38 @@ class UI(QMainWindow):
                 except Exception as e:
                     log.warning("Hotkey cleanup failed: %s", e)
     def check(self):
-        message = "Ollama connected ✓" if self.llm.ping() else "Ollama unreachable — start Ollama and pull qwen3:8b."
+        if self._ollama_check_running:
+            return
+        self._ollama_check_running = True
+        threading.Thread(
+            target=lambda:self.ollama_checked.emit(self.llm.model_status()),
+            daemon=True,
+        ).start()
+    def _apply_ollama_status(self, result):
+        self._ollama_check_running = False
+        models, error = result
+        selected = self.model_box.currentText() or load()["ollama"]["chat_model"]
+        configured = load()["ollama"]["chat_model"]
+        choices = list(dict.fromkeys(["qwen3:8b", *models, configured, selected]))
+        self.model_box.clear()
+        self.model_box.addItems(choices)
+        self.model_box.setCurrentText(selected)
+
+        if error:
+            message = (
+                f"Ollama is unreachable at {load()['ollama']['host']}. "
+                "Start Ollama; Himari will not download models automatically."
+            )
+            log.warning("Ollama is unavailable at startup: %s", error)
+        elif selected not in models:
+            message = (
+                f"Ollama connected, but '{selected}' is not installed. "
+                f"To add it, run: ollama pull {selected}"
+            )
+            log.warning("Selected Ollama model is not installed: %s", selected)
+        else:
+            message = f"Ollama connected ✓ — {selected} is available."
+            log.info("Ollama model available at startup: %s", selected)
         if self.hotkey_error:
             message = f"{message} {self.hotkey_error}"
         if self.screen_hotkey_error:
@@ -263,6 +316,22 @@ class UI(QMainWindow):
         label, color = states.get(state, states["Idle"])
         self.avatar_state.setText(label)
         self.avatar_state.setStyleSheet(f"color: {color}; background: rgba(125,90,146,0.20); border-radius: 10px; padding: 5px 10px;")
+        avatar_state = {
+            "Listening": "listening",
+            "Thinking": "thinking",
+            "Speaking": "speaking",
+            "Working": "thinking",
+            "Error": "error",
+        }.get(state, "idle")
+        self.avatar.set_state(avatar_state)
+        self.floating_avatar.set_state(avatar_state)
+    def toggle_floating_avatar(self):
+        if self.floating_avatar.isVisible():
+            self.floating_avatar.hide()
+            self.floating_avatar_btn.setText("Floating avatar")
+        else:
+            self.floating_avatar.show()
+            self.floating_avatar_btn.setText("Hide avatar")
     def _status(self,s):
         self.status_label.setText(s)
         if "error" in s.lower() or "failed" in s.lower():
@@ -271,7 +340,7 @@ class UI(QMainWindow):
             self._set_avatar_state("Listening")
         elif "generating" in s.lower() or "thinking" in s.lower() or "checking" in s.lower():
             self._set_avatar_state("Thinking")
-        elif "speaking" in s.lower() or "ready" in s.lower():
+        elif "speaking" in s.lower():
             self._set_avatar_state("Speaking")
         elif "tool" in s.lower() or "completed" in s.lower() or "working" in s.lower():
             self._set_avatar_state("Working")
@@ -350,9 +419,6 @@ class UI(QMainWindow):
             self._streamed_response = t
         self.chat.ensureCursorVisible()
         if load()["privacy"].get("store_conversations",True): db.add_message(self.session,"assistant",t)
-        if len(db.history(self.session, limit=40)) >= 6 and load()["privacy"].get("auto_memory", True):
-            recent = " | ".join(f"{m['role']}: {m['content']}" for m in db.history(self.session, limit=40))
-            db.save_summary(self.session, recent[:3000])
         self._speak(t)
     def _speak(self,t):
         try:
@@ -371,6 +437,14 @@ class UI(QMainWindow):
         self._status("Hmm, let me think.")
         self.chat.append(f"\nYou: {text}\nHimari: ")
         if load()["privacy"].get("store_conversations",True): db.add_message(self.session,"user",text)
+        privacy = load()["privacy"]
+        if privacy.get("store_conversations", True) and privacy.get("auto_memory", True):
+            try:
+                if db.suggest_memory(text):
+                    self.refresh_mem()
+            except Exception as exc:
+                log.exception("Could not save a memory suggestion")
+                self.status.emit(f"Memory suggestion error: {exc}")
         relevant = db.relevant_memories(text, limit=8)
         summary = db.summary_for_session(self.session)
         msgs=persona.build(
@@ -487,14 +561,44 @@ class UI(QMainWindow):
         self.send()
     def screen_query(self):
         if self.busy:
-            self._status("Wait for the current response to finish before capturing the screen.")
+            self._status(
+                "Wait for the current response to finish "
+                "before capturing the screen."
+            )
             return
+        if not self.cb_screen.isChecked():
+            self._status("Screen capture is disabled in Settings.")
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Allow one-time screen capture?",
+            (
+                "Himari will capture your primary screen once, "
+                "extract visible text locally, and discard the screenshot.\n\n"
+                "The extracted text will be sent to your local Ollama model.\n\n"
+                "Continue?"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+
+        if answer != QMessageBox.Yes:
+            self._status("Screen capture cancelled.")
+            return
+
         question = self.input.text().strip()
-        self.analyze_btn.setEnabled(False); self._status("Capturing the primary screen and reading its text…")
+        self.analyze_btn.setEnabled(False)
+        self._status("Capturing the primary screen and reading its text locally…")
+
         def work():
-            try: self.screen_result.emit(analyze(), question)
-            except Exception as e: self.screen_error.emit(f"Screen error: {e}")
-        threading.Thread(target=work,daemon=True).start()
+            try:
+                self.screen_result.emit(analyze(), question)
+            except Exception as e:
+                self.screen_error.emit(f"Screen error: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _screen_result(self,text,question):
         self.analyze_btn.setEnabled(True)
         if self.isHidden():
@@ -510,8 +614,30 @@ class UI(QMainWindow):
     def clear_chat(self):
         self.chat.clear(); db.clear_session(self.session)
     def refresh_mem(self):
+        query=self.memory_search.text().strip().casefold()
         self.mem_list.clear()
-        for m in db.memories(): self.mem_list.addItem(f"{m['id'][:8]} — {m['text']}")
+        for m in db.memories():
+            if not query or query in m["text"].casefold():
+                self.mem_list.addItem(f"{m['id'][:8]} — {m['text']}")
+        self.suggestion_list.clear()
+        for suggestion in db.memory_suggestions():
+            self.suggestion_list.addItem(
+                f"{suggestion['id'][:8]} — {suggestion['text']}"
+            )
+    def _selected_memory_suggestion(self):
+        row=self.suggestion_list.currentRow()
+        suggestions=db.memory_suggestions()
+        return suggestions[row] if 0 <= row < len(suggestions) else None
+    def approve_memory_suggestion(self):
+        suggestion=self._selected_memory_suggestion()
+        if suggestion:
+            db.add_memory(suggestion["text"],source="user",approved=1)
+            self.refresh_mem()
+    def reject_memory_suggestion(self):
+        suggestion=self._selected_memory_suggestion()
+        if suggestion:
+            db.delete_memory(suggestion["id"])
+            self.refresh_mem()
     def refresh_actions(self):
         self.activity_list.clear()
         for action in db.recent_actions():
@@ -534,10 +660,14 @@ class UI(QMainWindow):
     def closeEvent(self,e):
         cfg=load()
         cfg["privacy"]["store_conversations"]=self.cb_store.isChecked()
+        cfg["privacy"]["auto_memory"]=self.cb_auto_memory.isChecked()
         cfg["permissions"]["allow_open_app"]=self.cb_apps.isChecked()
         cfg["permissions"]["allow_open_url"]=self.cb_web.isChecked()
         cfg["permissions"]["allow_web_research"]=self.cb_research.isChecked()
-        cfg["permissions"]["allow_run_command"]=self.cb_cmd.isChecked()
+        cfg["permissions"]["allow_screen_capture"]=self.cb_screen.isChecked()
+        cfg["permissions"]["allow_active_window"]=self.cb_active_window.isChecked()
+        cfg["permissions"]["allow_media_control"]=self.cb_media.isChecked()
+        cfg["permissions"]["allow_run_command"] = False
         cfg["permissions"]["allow_write_file"]=self.cb_write.isChecked()
         cfg["ui"]["always_on_top"]=self.cb_always_on_top.isChecked()
         cfg["ui"]["minimize_to_tray"]=self.cb_minimize_to_tray.isChecked()
@@ -567,8 +697,11 @@ class UI(QMainWindow):
         self._remove_hotkeys()
         if self.tray is not None:
             self.tray.hide()
+        self.floating_avatar.hide()
         self._allow_quit = False
         super().closeEvent(e)
 def run():
-    logging.basicConfig(level=logging.INFO,format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    from .logging_setup import configure_logging
+
+    configure_logging()
     app=QApplication(sys.argv); w=UI(); w.show(); sys.exit(app.exec())

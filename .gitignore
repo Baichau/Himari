@@ -6,6 +6,8 @@ dist/
 installer/*.exe
 wheelhouse/
 models/
+.build/
+release/
 *.py[cod]
 *.log
 config.json

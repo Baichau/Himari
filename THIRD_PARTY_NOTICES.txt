@@ -51,6 +51,13 @@ The upstream Amy model and its configuration are included unchanged. The
 voice files remain under their applicable upstream license; this notice does
 not apply that license to Himari's separate application code.
 
+An alternate en_US-lessac-medium Piper voice may be bundled when it is the
+only complete local English voice available. Its voice model is distributed
+under Creative Commons Attribution-ShareAlike 4.0 International (CC BY-SA
+4.0). The upstream model card and files are available at:
+https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/lessac/medium
+https://creativecommons.org/licenses/by-sa/4.0/
+
 
 emoji Python package
 ====================

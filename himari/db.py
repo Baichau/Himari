@@ -56,11 +56,75 @@ def clear_session(session):
         c.execute("DELETE FROM messages WHERE session=?", (session,))
         c.execute("DELETE FROM summaries WHERE session=?", (session,))
 def add_memory(text,source="user",approved=1):
+    if not isinstance(text, str):
+        raise TypeError("Memory text must be a string.")
     text=text.strip()
     if not text: return None
     with _lock, conn() as c:
-        try: c.execute("INSERT OR IGNORE INTO memories VALUES(?,?,?,?,?)",(str(uuid.uuid4()),text,source,time.time(),approved))
-        except Exception: pass
+        normalized = text.casefold()
+        existing = c.execute("SELECT id, text, approved FROM memories").fetchall()
+        for row in existing:
+            if row["text"].strip().casefold() == normalized:
+                if approved and not row["approved"]:
+                    c.execute(
+                        "UPDATE memories SET approved=1, source=? WHERE id=?",
+                        (source, row["id"]),
+                    )
+                return row["id"]
+        memory_id = str(uuid.uuid4())
+        cursor = c.execute(
+            "INSERT OR IGNORE INTO memories VALUES(?,?,?,?,?)",
+            (memory_id,text,source,time.time(),int(bool(approved))),
+        )
+        return memory_id if cursor.rowcount else None
+
+
+_MEMORY_REQUEST = re.compile(
+    r"^\s*(?:please\s+)?remember\s+that\s+(.+?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_SENSITIVE_MEMORY = re.compile(
+    r"\b(?:password|passphrase|pin|secret|api[\s_-]?key|token|"
+    r"one[-\s]?time code|verification code|credit card|ssn|"
+    r"phone|email|address|passport|bank account|date of birth|"
+    r"парол\w*|пин-код|секрет\w*|токен\w*|код подтверждения|"
+    r"номер карты|номер телефона|телефон\w*|адрес\w*|домашний адрес|дата рождения|паспорт)\b|"
+    r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b|"
+    r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b",
+    re.IGNORECASE,
+)
+_TEMPORARY_MEMORY = re.compile(
+    r"\b(?:today|tomorrow|tonight|right now|for now|currently|at present|this week|this month|"
+    r"сегодня|завтра|сейчас|временно|пока что|на этой неделе)\b",
+    re.IGNORECASE,
+)
+
+
+def suggest_memory(message):
+    if not isinstance(message, str):
+        return None
+    match = _MEMORY_REQUEST.match(message)
+    if not match:
+        return None
+    candidate = match.group(1).strip()
+    if (
+        not candidate
+        or len(candidate) > 240
+        or _SENSITIVE_MEMORY.search(candidate)
+        or _TEMPORARY_MEMORY.search(candidate)
+    ):
+        return None
+    return add_memory(candidate, source="suggestion", approved=0)
+
+
+def memory_suggestions(limit=200):
+    with _lock, conn() as c:
+        return [
+            dict(row) for row in c.execute(
+                "SELECT * FROM memories WHERE approved=0 ORDER BY created DESC LIMIT ?",
+                (limit,),
+            )
+        ]
 def memories(limit=200):
     with _lock, conn() as c:
         return [dict(r) for r in c.execute("SELECT * FROM memories WHERE approved=1 ORDER BY created DESC LIMIT ?",(limit,))]
@@ -68,14 +132,18 @@ def memories(limit=200):
 def relevant_memories(query, limit=8):
     q = (query or "").strip()
     if not q:
-        return memories(limit=limit)
-    tokens = [t.lower() for t in re.findall(r"[A-Za-z0-9_]+", q) if len(t) > 2]
+        return []
+    tokens = [
+        token.casefold()
+        for token in re.findall(r"[^\W_]+", q, flags=re.UNICODE)
+        if len(token) > 2
+    ]
     if not tokens:
-        return memories(limit=limit)
+        return []
     rows = memories(limit=200)
     ranked = []
     for item in rows:
-        text = (item.get("text") or "").lower()
+        text = (item.get("text") or "").casefold()
         score = 0
         for token in tokens:
             score += text.count(token)

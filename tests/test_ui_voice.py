@@ -78,6 +78,24 @@ def test_screen_failure_reenables_capture_button():
     assert events == [True, "Screen error"]
 
 
+def test_screen_capture_permission_blocks_the_capture_prompt(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        ui.QMessageBox,
+        "question",
+        lambda *args: (_ for _ in ()).throw(AssertionError("permission gate must run first")),
+    )
+    window = SimpleNamespace(
+        busy=False,
+        cb_screen=SimpleNamespace(isChecked=lambda: False),
+        _status=events.append,
+    )
+
+    UI.screen_query(window)
+
+    assert events == ["Screen capture is disabled in Settings."]
+
+
 def test_screen_result_restores_hidden_window_after_ocr():
     events = []
 
