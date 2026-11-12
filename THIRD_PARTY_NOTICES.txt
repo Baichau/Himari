@@ -1,11 +1,58 @@
-Bundled Whisper large-v3-turbo speech model
-============================================
+Bundled KaTeX math renderer
+===========================
 
-The faster-whisper CTranslate2 model is converted from OpenAI's
-openai/whisper-large-v3-turbo model:
+KaTeX 0.19.1 is bundled under himari/web_assets/katex and is distributed
+under the MIT License. Copyright (c) 2013-2020 Khan Academy and other
+contributors. The full license text is included as
+himari/web_assets/KATEX-LICENSE.txt.
+Source: https://github.com/KaTeX/KaTeX
+
+
+Bundled Mermaid diagram renderer
+================================
+
+Mermaid 12.3.0 is bundled as himari/web_assets/mermaid.min.js and is
+distributed under the MIT License. Copyright (c) 2014 - 2022 Knut Sveidqvist.
+The full license text is included as himari/web_assets/MERMAID-LICENSE.txt.
+Source: https://github.com/mermaid-js/mermaid
+
+
+Python helper libraries
+=======================
+
+markdown-it-py (MIT License, Copyright (c) 2020 Executable Book Project)
+https://github.com/executablebooks/markdown-it-py
+
+pypdf (BSD 3-Clause License, Copyright (c) 2006-2024 pypdf contributors)
+https://github.com/py-pdf/pypdf
+
+openpyxl (MIT License, Copyright (c) 2010 openpyxl)
+https://foss.heptapod.net/openpyxl/openpyxl
+
+httpx (BSD 3-Clause License, Copyright (c) 2019 Encode OSS Ltd.)
+https://github.com/encode/httpx
+
+Playwright (Apache License 2.0, Copyright (c) Microsoft Corporation)
+https://github.com/microsoft/playwright-python
+https://www.apache.org/licenses/LICENSE-2.0
+
+QtWebEngine (LGPLv3 / commercial dual license, part of Qt 6)
+https://www.qt.io/qt-6/qtwebengine-index.html
+
+
+Bundled Faster-Whisper speech model
+===================================
+
+The faster-whisper CTranslate2 model bundled with a build is converted from
+an OpenAI Whisper model. This tested build includes the English-only base.en
+model:
+https://huggingface.co/openai/whisper-base.en
+
+Multilingual builds may instead include the large-v3-turbo model:
 https://huggingface.co/openai/whisper-large-v3-turbo
 
-The converted model repository declares the MIT license:
+Converted CTranslate2 model repositories, such as the large-v3-turbo
+conversion below, declare the MIT license:
 https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo
 
 Original Whisper MIT license notice:
@@ -31,6 +78,27 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+Bundled Stable Diffusion image engine
+=====================================
+
+The portable release embeds `sd-server` from stable-diffusion.cpp (commit
+465adf3) together with its ggml Vulkan libraries. stable-diffusion.cpp and
+ggml are distributed under the MIT License; the license texts travel with the
+embedded server files as `stable-diffusion.cpp.txt` and `ggml.txt`.
+https://github.com/leejet/stable-diffusion.cpp
+https://github.com/ggml-org/ggml
+
+The bundled checkpoint is Stable Diffusion v1.5 quantized to GGUF Q8_0
+(gpustack/stable-diffusion-v1-5-GGUF). Stable Diffusion v1.5 is distributed
+under the CreativeML OpenRAIL-M license, which permits use and redistribution
+with use-based restrictions:
+https://huggingface.co/runwayml/stable-diffusion-v1-5
+https://huggingface.co/spaces/CompVis/stable-diffusion-license
+
+The checkpoint is generated locally on the user's machine; Himari does not
+download model weights.
 
 
 Bundled English Piper voice

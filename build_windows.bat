@@ -14,5 +14,5 @@ if defined ISCC (
     if errorlevel 1 exit /b 1
     echo Installer built: installer\HimariSetup.exe
 ) else (
-    echo Inno Setup was not found. The portable app is in release\Himari.
+    echo Inno Setup was not found. The portable app is release\Himari.exe.
 )

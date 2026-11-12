@@ -23,6 +23,49 @@ def history(session,limit=60):
         rows=c.execute("SELECT role,content FROM messages WHERE session=? ORDER BY ts DESC LIMIT ?",(session,limit)).fetchall()
     return [{"role":r["role"],"content":r["content"]} for r in reversed(rows)]
 
+
+def messages_detailed(session, limit=200):
+    with _lock, conn() as c:
+        rows = c.execute(
+            "SELECT role,content,ts FROM messages WHERE session=? ORDER BY ts DESC LIMIT ?",
+            (session, limit),
+        ).fetchall()
+    return [
+        {"role": row["role"], "content": row["content"], "ts": row["ts"]}
+        for row in reversed(rows)
+    ]
+
+
+def sessions(limit=40):
+    with _lock, conn() as c:
+        rows = c.execute(
+            """
+            SELECT m.session AS session,
+                   MAX(m.ts) AS updated,
+                   COUNT(*) AS messages,
+                   (
+                       SELECT content FROM messages first
+                       WHERE first.session = m.session AND first.role = 'user'
+                       ORDER BY first.ts ASC LIMIT 1
+                   ) AS title
+            FROM messages m
+            GROUP BY m.session
+            ORDER BY updated DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    result = []
+    for row in rows:
+        title = re.sub(r"\s+", " ", str(row["title"] or "")).strip()
+        result.append({
+            "session": row["session"],
+            "updated": row["updated"],
+            "messages": row["messages"],
+            "title": title[:64] or "Untitled chat",
+        })
+    return result
+
 def summary_for_session(session, limit=12):
     with _lock, conn() as c:
         row = c.execute(
@@ -55,6 +98,10 @@ def clear_session(session):
     with _lock, conn() as c:
         c.execute("DELETE FROM messages WHERE session=?", (session,))
         c.execute("DELETE FROM summaries WHERE session=?", (session,))
+def clear_all_sessions():
+    with _lock, conn() as c:
+        c.execute("DELETE FROM messages")
+        c.execute("DELETE FROM summaries")
 def add_memory(text,source="user",approved=1):
     if not isinstance(text, str):
         raise TypeError("Memory text must be a string.")
@@ -73,14 +120,21 @@ def add_memory(text,source="user",approved=1):
                 return row["id"]
         memory_id = str(uuid.uuid4())
         cursor = c.execute(
-            "INSERT OR IGNORE INTO memories VALUES(?,?,?,?,?)",
+            "INSERT OR IGNORE INTO memories(id,text,source,created,approved) VALUES(?,?,?,?,?)",
             (memory_id,text,source,time.time(),int(bool(approved))),
         )
         return memory_id if cursor.rowcount else None
 
 
 _MEMORY_REQUEST = re.compile(
-    r"^\s*(?:please\s+)?remember\s+that\s+(.+?)\s*$",
+    r"^\s*(?:please\s+)?(?:"
+    r"remember\s+that|"
+    r"remember\s*:\s*|"
+    r"keep\s+in\s+mind\s+that|"
+    r"don'?t\s+forget\s+that|"
+    r"note\s+that|"
+    r"запомни\s*,?\s*(?:что\s*)?"
+    r")(.+?)\s*$",
     re.IGNORECASE | re.DOTALL,
 )
 _SENSITIVE_MEMORY = re.compile(
@@ -98,6 +152,10 @@ _TEMPORARY_MEMORY = re.compile(
     r"сегодня|завтра|сейчас|временно|пока что|на этой неделе)\b",
     re.IGNORECASE,
 )
+
+
+def memory_is_sensitive(text):
+    return bool(_SENSITIVE_MEMORY.search(text or ""))
 
 
 def suggest_memory(message):
@@ -128,6 +186,16 @@ def memory_suggestions(limit=200):
 def memories(limit=200):
     with _lock, conn() as c:
         return [dict(r) for r in c.execute("SELECT * FROM memories WHERE approved=1 ORDER BY created DESC LIMIT ?",(limit,))]
+
+def memory_counts():
+    with _lock, conn() as c:
+        approved = c.execute(
+            "SELECT COUNT(*) FROM memories WHERE approved=1"
+        ).fetchone()[0]
+        suggestions = c.execute(
+            "SELECT COUNT(*) FROM memories WHERE approved=0"
+        ).fetchone()[0]
+    return {"approved": approved, "suggestions": suggestions}
 
 def relevant_memories(query, limit=8):
     q = (query or "").strip()

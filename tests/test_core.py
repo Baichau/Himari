@@ -1,4 +1,15 @@
-from himari import db, persona, config, logging_setup, paths
+import os
+
+from himari import db, persona, config, logging_setup, paths, bootstrap
+
+
+def test_bootstrap_normalizes_bracketed_ipv6_no_proxy_entries(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "localhost,127.0.0.1,[::1]")
+
+    bootstrap._normalize_proxy_environment()
+
+    assert os.environ["NO_PROXY"] == "localhost,127.0.0.1,::1"
+
 def test_memory_roundtrip():
     db.add_memory("unique_test_fact_123","test")
     assert any("unique_test_fact_123" in m["text"] for m in db.memories())
@@ -82,6 +93,52 @@ def test_clear_session_removes_messages_and_summaries(tmp_path):
         db.DB = original_db
 
 
+def test_clear_all_sessions_removes_chats_but_keeps_memories(tmp_path):
+    original_dir = db.APP_DIR
+    original_db = db.DB
+    try:
+        db.APP_DIR = tmp_path
+        db.DB = tmp_path / "himari.db"
+        db.add_message("first", "user", "hello from the first chat")
+        db.add_message("second", "user", "hello from the second chat")
+        db.save_summary("first", "first summary")
+        db.add_memory("I prefer tea", "test")
+
+        db.clear_all_sessions()
+
+        assert db.sessions() == []
+        assert db.history("first") == []
+        assert db.summary_for_session("first") == ""
+        assert [memory["text"] for memory in db.memories()] == ["I prefer tea"]
+    finally:
+        db.APP_DIR = original_dir
+        db.DB = original_db
+
+
+def test_explicit_memory_requests_support_common_phrasings(tmp_path):
+    original_dir = db.APP_DIR
+    original_db = db.DB
+    try:
+        db.APP_DIR = tmp_path
+        db.DB = tmp_path / "himari.db"
+
+        assert db.suggest_memory("Keep in mind that I use Windows 11.")
+        assert db.suggest_memory("Don't forget that I prefer short answers.")
+        assert db.suggest_memory("Note that my project is Himari.")
+        assert db.suggest_memory("Запомни, что я предпочитаю русский язык.")
+
+        texts = {item["text"] for item in db.memory_suggestions()}
+        assert "I use Windows 11." in texts
+        assert "I prefer short answers." in texts
+        assert "my project is Himari." in texts
+        assert "я предпочитаю русский язык." in texts
+        assert db.memory_is_sensitive("Call me at 555-123-4567") is True
+        assert db.memory_is_sensitive("I prefer short answers.") is False
+    finally:
+        db.APP_DIR = original_dir
+        db.DB = original_db
+
+
 def test_memory_search_matches_cyrillic_terms(tmp_path):
     original_dir = db.APP_DIR
     original_db = db.DB
@@ -140,6 +197,32 @@ def test_memory_suggestions_need_approval_and_reject_sensitive_or_temporary_fact
 
         assert db.memory_suggestions() == []
         assert db.memories()[0]["text"] == "I prefer Russian replies."
+    finally:
+        db.APP_DIR = original_dir
+        db.DB = original_db
+
+
+def test_sessions_are_grouped_and_titled_from_the_first_user_message(tmp_path):
+    original_dir = db.APP_DIR
+    original_db = db.DB
+    try:
+        db.APP_DIR = tmp_path
+        db.DB = tmp_path / "himari.db"
+        db.add_message("first-chat", "user", "How do I fix this build?")
+        db.add_message("first-chat", "assistant", "Let us check the failing step.")
+        db.add_message("second-chat", "user", "Open Spotify")
+
+        rows = db.sessions()
+        by_session = {row["session"]: row for row in rows}
+
+        assert set(by_session) == {"first-chat", "second-chat"}
+        assert by_session["first-chat"]["title"] == "How do I fix this build?"
+        assert by_session["first-chat"]["messages"] == 2
+        assert by_session["second-chat"]["messages"] == 1
+
+        detailed = db.messages_detailed("first-chat")
+        assert [message["role"] for message in detailed] == ["user", "assistant"]
+        assert all("ts" in message for message in detailed)
     finally:
         db.APP_DIR = original_dir
         db.DB = original_db

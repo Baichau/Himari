@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from .config import APP_DIR
@@ -25,10 +25,13 @@ def _asset_dirs():
 
 
 class AvatarWidget(QLabel):
+    clicked = Signal()
+
     def __init__(self, parent=None, asset_dirs=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(48, 48)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setStyleSheet(
             "QLabel { color: #bca9c8; background: transparent; }"
         )
@@ -134,6 +137,13 @@ class AvatarWidget(QLabel):
         if self._state == "idle":
             self._display_frame()
 
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self._pixmap is not None:
@@ -156,7 +166,7 @@ class FloatingAvatarWindow(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Himari")
-        self.resize(240, 280)
+        self.resize(300, 430)
         self.avatar = AvatarWidget(self, asset_dirs=asset_dirs)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)

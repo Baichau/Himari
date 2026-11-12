@@ -16,6 +16,17 @@ if avatar_dir.is_dir():
         for asset in sorted(avatar_dir.glob("*.png"))
     )
 
+web_assets_dir = ROOT / "himari" / "web_assets"
+if web_assets_dir.is_dir():
+    for asset in sorted(web_assets_dir.rglob("*")):
+        if not asset.is_file():
+            continue
+        relative = asset.relative_to(web_assets_dir)
+        target = "himari/web_assets"
+        if relative.parent != Path("."):
+            target = f"himari/web_assets/{relative.parent.as_posix()}"
+        datas.append((str(asset), target))
+
 models_dir = ROOT / "models"
 if models_dir.is_dir():
     for model_dir in sorted(models_dir.iterdir()):
@@ -50,6 +61,13 @@ if voice_dir.is_dir():
 binaries = []
 hiddenimports = [
     "keyboard",
+    "PySide6.QtWebEngineWidgets",
+    "PySide6.QtWebEngineCore",
+    "PySide6.QtWebChannel",
+    "markdown_it",
+    "pypdf",
+    "openpyxl",
+    "httpx",
     "winrt.windows.foundation",
     "winrt.windows.globalization",
     "winrt.windows.graphics.imaging",
@@ -66,6 +84,7 @@ for package in (
     "onnxruntime",
     "av",
     "winrt",
+    "playwright",
 ):
     collected_datas, collected_binaries, collected_imports = collect_all(package)
     datas += collected_datas

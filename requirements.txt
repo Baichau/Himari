@@ -1,4 +1,5 @@
 PySide6>=6.7
+PySide6-WebEngine>=6.7
 ollama>=0.6.3
 faster-whisper>=1.0.0
 huggingface-hub>=0.23.0
@@ -9,6 +10,10 @@ sounddevice>=0.4.6
 numpy
 mss
 Pillow
+markdown-it-py>=3.0
+pypdf>=5.0
+openpyxl>=3.1
+httpx
 winrt-Windows.Foundation>=3.2.1,<4
 winrt-Windows.Globalization>=3.2.1,<4
 winrt-Windows.Graphics.Imaging>=3.2.1,<4
@@ -17,5 +22,6 @@ winrt-Windows.Storage.Streams>=3.2.1,<4
 pygetwindow
 pyautogui
 psutil
+playwright>=1.40
 keyboard
 pyinstaller>=6.10

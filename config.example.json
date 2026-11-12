@@ -1,8 +1,11 @@
 {
-  "ollama": {"host":"http://127.0.0.1:11434","chat_model":"qwen3:8b","vision_model":"qwen3:8b","temperature":0.7,"timeout_seconds":180},
-  "voice": {"stt_model":"large-v3-turbo","tts_voice":"en_US-amy-medium","volume":1.0,"push_to_talk_key":"f9","language":"en","recognition_language":"auto","wake_word_enabled":false,"wake_word":"Himari","microphone_device":null,"sensitivity":0.75},
+  "ollama": {"host":"http://127.0.0.1:11434","chat_model":"qwen3:8b","vision_model":"qwen2.5vl:3b","vision_timeout_seconds":300,"temperature":0.7,"timeout_seconds":180,"stream_timeout_seconds":900,"keep_alive":"30m","preload_model":true,"deep_reasoning":true},
+  "imagegen": {"base_url":"http://127.0.0.1:8080","auto_start":true,"free_ollama_vram":true,"timeout_seconds":600,"steps":28,"width":768,"height":768,"cfg_scale":7.0,"sampler":"Euler a","negative_prompt":"blurry, low quality, watermark, text, logo, deformed, extra limbs"},
+  "voice": {"stt_model":"large-v3-turbo","tts_voice":"en_US-amy-medium","volume":1.0,"speak_replies":true,"push_to_talk_key":"f9","language":"en","recognition_language":"auto","wake_word_enabled":false,"wake_word":"Himari","microphone_device":null,"sensitivity":0.75},
   "screen": {"monitor":"primary","capture_hotkey":"f10"},
-  "privacy": {"store_conversations":true,"auto_memory":true},
-  "permissions": {"allow_open_app":true,"allow_open_url":true,"allow_web_research":true,"allow_volume":true,"allow_read_file":true,"allow_screen_capture":true,"allow_active_window":false,"allow_media_control":false,"allow_run_command":false,"allow_write_file":false,"allowed_folders":["~/Documents","~/Downloads"]},
-  "ui": {"theme":"dark","font_size":14,"always_on_top":false,"minimize_to_tray":true}
+  "privacy": {"store_conversations":true,"auto_memory":true,"memory_enabled":true},
+  "development": {"workspaces":[]},
+  "personality": {"name":"Himari","playfulness":"medium","roleplay":"minimal"},
+  "permissions": {"allow_open_app":true,"allow_open_url":true,"allow_web_research":true,"allow_vision":true,"allow_image_generation":true,"allow_volume":true,"allow_read_file":true,"allow_screen_capture":true,"allow_active_window":false,"allow_media_control":false,"allow_run_command":false,"allow_write_file":false,"allow_browser_automation":false,"allowed_folders":["~/Documents","~/Downloads"]},
+  "ui": {"theme":"dark","font_size":14,"always_on_top":false,"minimize_to_tray":true,"chat_engine":"web"}
 }

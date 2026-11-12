@@ -1,10 +1,32 @@
 import argparse
 import ctypes
 import logging
+import os
 import sys
 import traceback
 
 log = logging.getLogger("himari.bootstrap")
+
+
+def _normalize_proxy_environment():
+    # httpx (used by ollama at import time) cannot parse bracketed IPv6
+    # NO_PROXY entries such as "[::1]" and treats them as an invalid port.
+    names = ("NO_PROXY",) if os.name == "nt" else ("NO_PROXY", "no_proxy")
+    for name in names:
+        value = os.environ.get(name)
+        if not value:
+            continue
+        entries = []
+        rewritten = False
+        for entry in value.split(","):
+            entry = entry.strip()
+            if len(entry) > 2 and entry[0] == "[" and entry[-1] == "]":
+                entry = entry[1:-1]
+                rewritten = True
+            if entry:
+                entries.append(entry)
+        if rewritten:
+            os.environ[name] = ",".join(entries)
 
 
 def _show_error(message):
@@ -42,6 +64,7 @@ def main(argv=None):
     options = parser.parse_args(argv)
 
     try:
+        _normalize_proxy_environment()
         from .logging_setup import configure_logging
 
         log_path = configure_logging()

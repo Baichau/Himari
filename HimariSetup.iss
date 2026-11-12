@@ -1,5 +1,5 @@
 #define MyAppName "Himari"
-#define MyAppVersion "3.0.0"
+#define MyAppVersion "4.0.0"
 
 [Setup]
 AppId={{4F0573A3-1F86-4BA2-AB19-04E983E81DC4}
@@ -16,7 +16,7 @@ SolidCompression=yes
 WizardStyle=modern
 
 [Files]
-Source: "release\Himari\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "release\Himari.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Himari"; Filename: "{app}\Himari.exe"

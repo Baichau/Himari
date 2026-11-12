@@ -8,6 +8,9 @@ wheelhouse/
 models/
 .build/
 release/
+_internal/
+/Himari.exe
+*.zip
 *.py[cod]
 *.log
 config.json
