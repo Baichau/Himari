@@ -12,6 +12,20 @@ from .errors import AmbiguousAppError, AppNotFoundError
 
 log = logging.getLogger("himari.windows")
 
+BROWSER_NAMES = {
+    "chrome.exe": {"chrome", "google chrome"},
+    "msedge.exe": {"edge", "microsoft edge"},
+    "firefox.exe": {"firefox", "mozilla firefox"},
+    "brave.exe": {"brave", "brave browser"},
+    "opera.exe": {"opera"},
+    "vivaldi.exe": {"vivaldi"},
+    "arc.exe": {"arc"},
+}
+
+
+def _browser_aliases(process_name):
+    return BROWSER_NAMES.get((process_name or "").casefold())
+
 
 def _allowed():
     config = load_config()
@@ -87,6 +101,18 @@ def close_app(name):
             [f"{window.title} ({window.process_name})" for window in matches],
         )
     window = matches[0]
+    aliases = _browser_aliases(window.process_name)
+    if aliases and needle not in aliases:
+        return {
+            "ok": False,
+            "app": window.title,
+            "message": (
+                "Refusing to close this browser window: it would close every tab "
+                "inside it. Individual tabs in the user's own browser cannot be "
+                "closed; a whole browser window can only be closed when the user "
+                "asks for the browser itself."
+            ),
+        }
     try:
         request_window_close(window.hwnd)
     except (OSError, RuntimeError) as exc:

@@ -1,6 +1,8 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from himari import chat_web
 from himari.attachments import Attachment
 
@@ -100,11 +102,196 @@ def test_tool_messages_follow_the_show_tools_flag():
     assert 'class="tool"' in visible
 
 
+def test_failed_tool_messages_are_marked_in_the_transcript():
+    failed = chat_web.render_messages_html(
+        [{"role": "tool", "content": "Denied: not allowed"}],
+        show_tools=True,
+    )
+    succeeded = chat_web.render_messages_html(
+        [{"role": "tool", "content": "Chrome is open."}],
+        show_tools=True,
+    )
+
+    assert 'class="tool tool-failed"' in failed
+    assert "FAILED" in failed
+    assert "tool-failed" not in succeeded
+
+
+def test_message_cards_carry_copy_text_and_a_copy_button():
+    rendered = chat_web.render_message_html(
+        {"role": "assistant", "content": 'say "hello" <b>now</b>'}
+    )
+
+    assert 'class="copy-msg"' in rendered
+    assert (
+        'data-copy="say &quot;hello&quot; &lt;b&gt;now&lt;/b&gt;"' in rendered
+    )
+
+
+def test_messages_without_text_have_no_copy_controls():
+    rendered = chat_web.render_message_html(
+        {"role": "assistant", "content": "", "image": "C:/tmp/pic.png"}
+    )
+
+    assert "copy-msg" not in rendered
+    assert 'class="generated"' in rendered
+
+
+def test_shell_styles_code_blocks_and_syntax_tokens():
+    shell = chat_web.shell_html(font_size=14, theme_name="dark")
+
+    assert ".code-block" in shell
+    assert ".copy-code" in shell
+    assert ".tok-kw" in shell
+    assert ".tok-str" in shell
+
+
+def test_copy_prompt_bridge_emits_the_text_and_refuses_other_prompts():
+    page_class = getattr(chat_web, "_ChatPage", None)
+    if page_class is None:
+        pytest.skip("QtWebEngine is unavailable")
+
+    class _Signal:
+        def __init__(self):
+            self.values = []
+
+        def emit(self, value):
+            self.values.append(value)
+
+    fake = SimpleNamespace(copyRequested=_Signal())
+
+    result = page_class.javaScriptPrompt(fake, "", "himari-copy", "print(1)\n")
+    refused = page_class.javaScriptPrompt(fake, "", "something else", "x")
+
+    assert result == (True, "1")
+    assert fake.copyRequested.values == ["print(1)\n"]
+    assert refused == (False, "")
+    assert fake.copyRequested.values == ["print(1)\n"]
+
+
+def test_fill_prompt_bridge_emits_the_welcome_suggestion():
+    page_class = getattr(chat_web, "_ChatPage", None)
+    if page_class is None:
+        pytest.skip("QtWebEngine is unavailable")
+
+    class _Signal:
+        def __init__(self):
+            self.values = []
+
+        def emit(self, value):
+            self.values.append(value)
+
+    fake = SimpleNamespace(fillRequested=_Signal())
+
+    result = page_class.javaScriptPrompt(fake, "", "himari-fill", "Open a fireplace video")
+
+    assert result == (True, "1")
+    assert fake.fillRequested.values == ["Open a fireplace video"]
+
+
 def test_empty_transcript_shows_a_welcome_screen():
     rendered = chat_web.render_messages_html([])
 
     assert 'class="welcome"' in rendered
     assert "Himari" in rendered
+    assert 'class="welcome-chips"' in rendered
+    assert 'data-prompt="' in rendered
+    assert "first reply after launch" in rendered
+
+
+def test_welcome_chips_are_clickable_buttons_without_image_generation():
+    rendered = chat_web.render_messages_html([])
+
+    assert '<button type="button" data-prompt="' in rendered
+    assert "Draw me a picture" not in rendered
+    assert "mind map" in rendered.casefold()
+
+
+def test_first_streaming_render_is_a_full_render():
+    payload, count, streaming = chat_web.build_render_payload(
+        [{"role": "assistant", "content": "Hel", "streaming": True}]
+    )
+
+    assert "html" in payload and "last" not in payload
+    assert 'class="cursor"' in payload["html"]
+    assert payload["streaming"] is True
+    assert count == 1 and streaming is True
+
+
+def test_repeated_streaming_render_sends_only_the_last_card():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hel", "streaming": True},
+    ]
+
+    payload, count, streaming = chat_web.build_render_payload(
+        messages,
+        rendered_count=2,
+        rendered_streaming=True,
+    )
+
+    assert "last" in payload and "html" not in payload
+    assert "Hel" in payload["last"]
+    assert "hi" not in payload["last"]
+    assert count == 2 and streaming is True
+
+
+def test_final_render_after_streaming_is_full_and_drops_the_cursor():
+    messages = [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello there"},
+    ]
+
+    payload, count, streaming = chat_web.build_render_payload(
+        messages,
+        rendered_count=2,
+        rendered_streaming=True,
+    )
+
+    assert "html" in payload and "last" not in payload
+    assert 'class="cursor"' not in payload["html"]
+    assert "Hello there" in payload["html"]
+    assert count == 2 and streaming is False
+
+
+def test_tool_toggle_changes_the_count_and_forces_a_full_render():
+    messages = [
+        {"role": "assistant", "content": "Hel", "streaming": True},
+        {"role": "tool", "content": "open_app({})"},
+    ]
+
+    hidden_payload, hidden_count, _ = chat_web.build_render_payload(
+        messages,
+        rendered_count=1,
+        rendered_streaming=True,
+    )
+    visible_payload, visible_count, _ = chat_web.build_render_payload(
+        messages,
+        show_tools=True,
+        rendered_count=1,
+        rendered_streaming=True,
+    )
+
+    assert hidden_count == 1 and "last" in hidden_payload
+    assert visible_count == 2
+    assert "html" in visible_payload and "last" not in visible_payload
+    assert 'class="tool"' in visible_payload["html"]
+
+
+def test_incremental_render_requires_the_streaming_card_to_be_last():
+    messages = [
+        {"role": "assistant", "content": "Hel", "streaming": True},
+        {"role": "system", "content": "note"},
+    ]
+
+    payload, count, _ = chat_web.build_render_payload(
+        messages,
+        rendered_count=2,
+        rendered_streaming=True,
+    )
+
+    assert count == 2
+    assert "html" in payload and "last" not in payload
 
 
 def test_role_cards_escape_untrusted_names():

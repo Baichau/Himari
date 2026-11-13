@@ -14,6 +14,7 @@ TOOL_RISKS = {
     "search_web": RiskLevel.LOW,
     "open_first_result": RiskLevel.LOW,
     "research_web": RiskLevel.LOW,
+    "find_video": RiskLevel.READ,
     "search_youtube": RiskLevel.LOW,
     "close_app": RiskLevel.MEDIUM,
     "list_project_files": RiskLevel.READ,
@@ -24,7 +25,6 @@ TOOL_RISKS = {
     "capture_screen_text": RiskLevel.MEDIUM,
     "active_window": RiskLevel.READ,
     "media_control": RiskLevel.LOW,
-    "generate_image": RiskLevel.LOW,
     "run_command": RiskLevel.HIGH,
     # Windows environment
     "installed_apps": RiskLevel.READ,
@@ -32,6 +32,15 @@ TOOL_RISKS = {
     "list_windows": RiskLevel.READ,
     "find_app": RiskLevel.READ,
     "launch_app": RiskLevel.LOW,
+    "focus_window": RiskLevel.MEDIUM,
+    # Screen control
+    "list_controls": RiskLevel.READ,
+    "click_control": RiskLevel.HIGH,
+    "set_control_text": RiskLevel.HIGH,
+    "type_text": RiskLevel.HIGH,
+    "press_keys": RiskLevel.HIGH,
+    "click_at": RiskLevel.HIGH,
+    "scroll_screen": RiskLevel.HIGH,
     # Perception
     "capture_screen": RiskLevel.MEDIUM,
     "screen_scene": RiskLevel.MEDIUM,
@@ -72,6 +81,7 @@ TOOL_PERMISSIONS = {
     "search_youtube": "allow_open_url",
     "open_first_result": "allow_open_url",
     "research_web": "allow_web_research",
+    "find_video": "allow_web_research",
     "close_app": "allow_open_app",
     "read_file": "allow_read_file",
     "list_project_files": "allow_read_file",
@@ -84,8 +94,15 @@ TOOL_PERMISSIONS = {
     "screen_scene": "allow_screen_capture",
     "active_window": "allow_active_window",
     "media_control": "allow_media_control",
-    "generate_image": "allow_image_generation",
+    "list_controls": "allow_screen_control",
+    "click_control": "allow_screen_control",
+    "set_control_text": "allow_screen_control",
+    "type_text": "allow_screen_control",
+    "press_keys": "allow_screen_control",
+    "click_at": "allow_screen_control",
+    "scroll_screen": "allow_screen_control",
     "launch_app": "allow_open_app",
+    "focus_window": "allow_open_app",
     "integration_open": "allow_open_app",
     "integration_close": "allow_open_app",
     "integration_action": "allow_open_app",
@@ -126,12 +143,20 @@ CONFIRMATION_TOOLS = {
     "write_file",
     "write_desktop_file",
     "capture_screen_text",
+    "screen_scene",
+    "focus_window",
+    "click_control",
+    "set_control_text",
+    "type_text",
+    "press_keys",
+    "click_at",
+    "scroll_screen",
     "run_command",
     "browser_submit",
 }
 
 # Even after approval these must ask again every time.
-NEVER_SESSION_GRANT = {"browser_submit"}
+NEVER_SESSION_GRANT = {"browser_submit", "press_keys"}
 
 
 def confirmation_required_for(tool):

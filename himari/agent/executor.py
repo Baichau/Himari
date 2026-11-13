@@ -1,31 +1,23 @@
 """Single-step tool execution behind the security layer."""
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 
 from ..security import SecurityLayer, risk_for
 from ..security.policies import tool_is_known
+from ..tool_exec import (
+    DEFAULT_TOOL_TIMEOUT_SECONDS,
+    ToolTimeoutError,
+    call as call_tool,
+    timeout_for,
+)
+from ..tool_results import classify_result
 from .state import AgentCancelledError, StepStatus
 from .tool_registry import ToolArgumentError, ToolRegistry, UnknownToolError
 
 log = logging.getLogger("himari.agent.executor")
 
-DEFAULT_STEP_TIMEOUT_SECONDS = 30
-
-_FAILURE_PREFIXES = (
-    "denied:",
-    "tool error:",
-    "permission denied",
-    "invalid arguments",
-    "unknown tool",
-    "outside the configured allowed folders",
-)
-
-
-class ToolTimeoutError(RuntimeError):
-    pass
+DEFAULT_STEP_TIMEOUT_SECONDS = DEFAULT_TOOL_TIMEOUT_SECONDS
 
 
 @dataclass
@@ -44,22 +36,6 @@ class ExecutionResult:
         return self.status is StepStatus.SUCCEEDED
 
 
-def classify_result(result):
-    """Never assume success: obvious failures become failed steps."""
-    if result is None:
-        return False, "The tool returned no result."
-    if isinstance(result, dict) and result.get("ok") is False:
-        return False, str(result.get("error") or "The tool reported failure.")
-    if isinstance(result, str):
-        text = result.strip()
-        if not text:
-            return False, "The tool returned an empty result."
-        lowered = text.casefold()
-        if lowered.startswith(_FAILURE_PREFIXES):
-            return False, text
-    return True, ""
-
-
 class Executor:
     def __init__(
         self,
@@ -71,14 +47,14 @@ class Executor:
         self.registry = registry or ToolRegistry()
         self.timeout_seconds = timeout_seconds
 
-    def execute(self, tool, arguments, token=None):
+    def execute(self, tool, arguments, token=None, on_start=None):
         if token is not None:
             token.check()
 
         risk = str(risk_for(tool)) if tool_is_known(tool) else "high"
 
         try:
-            self.registry.get(tool)
+            entry = self.registry.get(tool)
         except UnknownToolError:
             return ExecutionResult(
                 tool,
@@ -109,9 +85,12 @@ class Executor:
                 error=decision.reason,
             )
 
-        handler = self.registry.get(tool)["fn"]
+        handler = entry["fn"]
+        timeout = timeout_for(entry, self.timeout_seconds)
+        if on_start is not None:
+            on_start(tool)
         try:
-            result = self._call(handler, validated)
+            result = call_tool(handler, validated, timeout, tool)
         except ToolTimeoutError as exc:
             self.security.record_result(tool, validated, f"Timed out: {exc}")
             return ExecutionResult(
@@ -147,18 +126,3 @@ class Executor:
             result=result,
             error=error,
         )
-
-    def _call(self, handler, arguments):
-        pool = ThreadPoolExecutor(max_workers=1)
-        future = pool.submit(handler, **arguments)
-        try:
-            return future.result(timeout=self.timeout_seconds)
-        except FutureTimeoutError:
-            future.cancel()
-            pool.shutdown(wait=False, cancel_futures=True)
-            raise ToolTimeoutError(
-                f"'{getattr(handler, '__name__', 'tool')}' did not finish within "
-                f"{self.timeout_seconds} seconds and will not be retried automatically."
-            )
-        finally:
-            pool.shutdown(wait=False)

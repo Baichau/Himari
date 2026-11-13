@@ -151,6 +151,70 @@ def test_open_page_closes_blank_tab_when_navigation_fails(monkeypatch):
     assert manager.pages()[0] is pages[0]
 
 
+def test_open_page_reuses_the_current_tab_when_new_tab_is_false(monkeypatch):
+    manager, pages = _manager("Pinterest")
+
+    def fake_navigate(page, url, timeout_ms=None):
+        page.url = url
+        return {"ok": True, "url": url}
+
+    monkeypatch.setattr(tabs, "navigate", fake_navigate)
+
+    result = tabs.open_page(manager, "https://example.com/video", new_tab=False)
+
+    assert len(manager.pages()) == 1
+    assert manager.pages()[0] is pages[0]
+    assert pages[0].url == "https://example.com/video"
+    assert result["index"] == 1
+
+
+def test_open_page_refuses_to_exceed_the_tab_limit(monkeypatch):
+    manager, _ = _manager("One", "Two", "Three", "Four", "Five")
+    monkeypatch.setattr(tabs, "navigate", lambda page, url, timeout_ms=None: {
+        "ok": True, "url": url,
+    })
+
+    with pytest.raises(tabs.BrowserError, match="limit is 5"):
+        tabs.open_page(manager, "https://example.com/six", new_tab=True)
+
+    assert len(manager.pages()) == 5
+
+
+def test_open_search_replaces_an_existing_search_tab(monkeypatch):
+    page = FakePage("DuckDuckGo", "https://duckduckgo.com/?q=old+search")
+    manager = FakeManager([page])
+
+    def fake_navigate(target, url, timeout_ms=None):
+        target.url = url
+        return {"ok": True, "url": url}
+
+    monkeypatch.setattr(tabs, "navigate", fake_navigate)
+
+    result = tabs.open_search(manager, "fireplace video")
+
+    assert len(manager.pages()) == 1
+    assert manager.pages()[0] is page
+    assert "q=fireplace+video" in page.url
+    assert result["index"] == 1
+
+
+def test_open_search_keeps_an_unrelated_google_page(monkeypatch):
+    page = FakePage("Maps", "https://www.google.com/maps?q=paris")
+    manager = FakeManager([page])
+
+    def fake_navigate(target, url, timeout_ms=None):
+        target.url = url
+        return {"ok": True, "url": url}
+
+    monkeypatch.setattr(tabs, "navigate", fake_navigate)
+
+    tabs.open_search(manager, "fireplace video")
+
+    assert len(manager.pages()) == 2
+    assert page.url == "https://www.google.com/maps?q=paris"
+    assert manager.page.url.startswith("https://duckduckgo.com/")
+
+
 def test_read_active_returns_current_page(monkeypatch):
     manager, pages = _manager("One", "Two")
     manager.page = pages[1]

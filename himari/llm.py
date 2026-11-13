@@ -1,6 +1,8 @@
-import json, logging, re, time, ollama
+import json, logging, time, ollama
 from .config import load
 from . import db
+from .tool_exec import ToolTimeoutError, call as call_tool, timeout_for
+from .tool_results import classify_result
 log=logging.getLogger("himari.llm")
 MAX_TOOL_ROUNDS=5
 MAX_START_RETRIES=2
@@ -32,30 +34,81 @@ def _is_transient(message):
     return any(term in text for term in _TRANSIENT_ERRORS)
 
 
+def _validated_arguments(handler, arguments):
+    """Fail closed on malformed tool arguments before a handler runs."""
+    from .tool_schema import validate_arguments
+
+    spec = handler.get("spec") or {}
+    parameters = (spec.get("function") or {}).get("parameters") or {}
+    return validate_arguments(parameters, arguments)
+
+
+def _invoke_tool(handler, name, arguments):
+    """Run one tool with its own timeout and convert failures to observations."""
+    try:
+        return call_tool(
+            handler["fn"],
+            arguments,
+            timeout=timeout_for(handler),
+            label=name,
+        )
+    except ToolTimeoutError as exc:
+        return f"Timed out: {exc}"
+    except TypeError as exc:
+        return f"Invalid arguments: {exc}"
+    except Exception as exc:
+        return f"Tool error: {exc}"
+
+
+def _log_tool_outcome(name, result):
+    succeeded, error = classify_result(result)
+    if not succeeded:
+        log.info("Tool %s reported a failure: %s", name, error[:300])
+
+
+_RETRY_TAIL_LIMIT = 12
+_RETRY_TOOL_CHARS = 1200
+
+
 def _short_retry_messages(messages):
-    """Keep the instructions and current request when the model stalls."""
+    """Keep the instructions, the current request, and its tool results.
+
+    Retrying must not drop observations from tool work, otherwise the model
+    answers as if it never looked anything up. Old history is trimmed and long
+    tool outputs are capped instead.
+    """
+    messages = [m for m in (messages or []) if isinstance(m, dict)]
     system_messages = [
         dict(message)
-        for message in (messages or [])
-        if isinstance(message, dict) and message.get("role") == "system"
+        for message in messages
+        if message.get("role") == "system"
     ]
     last_user = next(
         (
-            dict(message)
-            for message in reversed(messages or [])
-            if isinstance(message, dict) and message.get("role") == "user"
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
         ),
         None,
     )
     if last_user is None:
         return None
-    return system_messages + [last_user]
+    tail = []
+    for message in messages[last_user:][: _RETRY_TAIL_LIMIT + 1]:
+        copy = dict(message)
+        content = copy.get("content")
+        if copy.get("role") == "tool" and isinstance(content, str):
+            if len(content) > _RETRY_TOOL_CHARS:
+                copy["content"] = content[:_RETRY_TOOL_CHARS] + " …"
+        tail.append(copy)
+    return system_messages + tail
 
 
 class LLM:
     def __init__(self, tools=None, security=None):
         self.tools=tools or []
         self.security=security
+        self.capabilities=None
     @property
     def cfg(self): return load()["ollama"]
     def client(self, timeout=None):
@@ -118,6 +171,22 @@ class LLM:
                 else:
                     time.sleep(delay)
         raise last_error
+    def _context_window(self):
+        try:
+            value = int(self.cfg.get("context_window", 8192))
+        except (TypeError, ValueError):
+            value = 8192
+        return max(2048, min(value, 32768))
+    def refresh_capabilities(self):
+        """Cache what the configured chat model actually supports."""
+        try:
+            from .models import model_capabilities
+
+            self.capabilities = model_capabilities(self.cfg.get("chat_model"))
+        except Exception as exc:
+            log.info("Model capability check skipped: %s", exc)
+            self.capabilities = None
+        return self.capabilities
     def preload(self):
         cfg = self.cfg
         client = self.client(timeout=cfg.get("stream_timeout_seconds", 900))
@@ -126,16 +195,42 @@ class LLM:
             messages=[{"role": "user", "content": "Hi"}],
             stream=False,
             keep_alive=cfg.get("keep_alive", "30m"),
-            options={"num_predict": 1, "temperature": 0},
+            options={
+                "num_predict": 1,
+                "temperature": 0,
+                "num_ctx": self._context_window(),
+            },
         )
     def stream_chat(self, messages, on_token=None, on_tool=None, confirm=None,
-                    cancel_event=None, on_status=None, think=False, on_image=None):
+                    cancel_event=None, on_status=None, think=False):
         cfg=self.cfg
+        think_requested=bool(think)
+        if (
+            think_requested
+            and self.capabilities is not None
+            and "thinking" not in self.capabilities
+        ):
+            think_requested=False
+            if on_status:
+                on_status(
+                    f"{cfg['chat_model']} does not support deep thinking — "
+                    "answering directly."
+                )
+        tools_supported = self.capabilities is None or "tools" in self.capabilities
         payload={"model":cfg["chat_model"],"messages":messages,"stream":True,
-                 "options":{"temperature":cfg.get("temperature",0.7)},
-                 "think":bool(think),
+                 "options":{
+                     "temperature":cfg.get("temperature",0.7),
+                     "num_ctx":self._context_window(),
+                 },
+                 "think":think_requested,
                  "keep_alive":cfg.get("keep_alive","30m")}
-        if self.tools: payload["tools"]=[t["spec"] for t in self.tools]
+        if self.tools and tools_supported:
+            payload["tools"]=[t["spec"] for t in self.tools]
+        elif self.tools and on_status:
+            on_status(
+                f"{cfg['chat_model']} does not support tool calls — "
+                "answering without desktop control."
+            )
         client=self.client(timeout=self._stream_timeout())
         def cancelled():
             return cancel_event is not None and cancel_event.is_set()
@@ -235,43 +330,42 @@ class LLM:
                     raise LLMCancelled(content)
                 name=tc.function.name; args=tc.function.arguments or {}
                 handler=next((t for t in self.tools if t["name"]==name),None)
-                if name == "generate_image" and on_status:
-                    on_status("Drawing your image locally…")
+                if name == "research_web" and on_status:
+                    on_status("Researching the web and reading sources…")
                 allowed=False
                 if not isinstance(args,dict):
                     result="Invalid arguments: tool arguments must be an object."
                 elif not handler:
                     result=f"Unknown tool: {name}"
-                elif self.security is not None:
-                    decision=self.security.authorize(name,args)
-                    allowed=decision.allowed
-                    if not allowed:
-                        result=f"Denied: {decision.reason}"
-                    else:
-                        try: result=handler["fn"](**args)
-                        except TypeError as e: result=f"Invalid arguments: {e}"
-                        except Exception as e: result=f"Tool error: {e}"
-                        self.security.record_result(name,args,result)
                 else:
-                    needs_confirmation=handler.get("confirm",False)
-                    allowed=not needs_confirmation
-                    if needs_confirmation and confirm:
-                        allowed=bool(confirm(name,args,handler.get("confirm_message","Allow this action?")))
-                    if not allowed:
-                        result="User denied this action or confirmation was unavailable."
+                    try:
+                        args=_validated_arguments(handler,args)
+                    except ValueError as e:
+                        result=f"Invalid arguments: {e}"
                     else:
-                        try: result=handler["fn"](**args)
-                        except TypeError as e: result=f"Invalid arguments: {e}"
-                        except Exception as e: result=f"Tool error: {e}"
+                        if self.security is not None:
+                            decision=self.security.authorize(name,args)
+                            allowed=decision.allowed
+                            if not allowed:
+                                result=f"Denied: {decision.reason}"
+                            else:
+                                result=_invoke_tool(handler,name,args)
+                                _log_tool_outcome(name, result)
+                                self.security.record_result(name,args,result)
+                        else:
+                            needs_confirmation=handler.get("confirm",False)
+                            allowed=not needs_confirmation
+                            if needs_confirmation and confirm:
+                                allowed=bool(confirm(name,args,handler.get("confirm_message","Allow this action?")))
+                            if not allowed:
+                                result="User denied this action or confirmation was unavailable."
+                            else:
+                                result=_invoke_tool(handler,name,args)
+                                _log_tool_outcome(name, result)
                 if self.security is None:
                     db.log_action(name,args,result,allowed)
                 if on_tool and not (handler and handler.get("silent", False)):
                     on_tool(name,args,result)
-                if on_image:
-                    for image_path in re.findall(
-                        r"^IMAGE_PATH:(.+)$", str(result), re.MULTILINE
-                    ):
-                        on_image(image_path.strip())
                 messages.append({"role":"tool","content":str(result),"tool_name":name})
         raise LLMError("Tool execution stopped unexpectedly.")
     def vision(self,images,prompt,model=None):

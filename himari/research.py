@@ -6,7 +6,7 @@ import time
 
 from . import db
 from .config import load
-from .tools import research_web
+from .tools import _notify_progress, research_web
 
 _CACHE_TTL_SECONDS = 600
 _MAX_QUERY_CHARS = 240
@@ -111,7 +111,7 @@ def should_research(text):
     return bool(_QUESTION_START.match(text) or _RESEARCH_HINT.search(text))
 
 
-def research_for_prompt(text):
+def research_for_prompt(text, *, cancel=None, progress=None):
     """Return web results for a factual question, or None when not needed."""
     if not should_research(text):
         return None
@@ -128,8 +128,9 @@ def research_for_prompt(text):
     with _cache_lock:
         cached = _cache.get(key)
         if cached and now - cached[0] < _CACHE_TTL_SECONDS:
+            _notify_progress(progress, "Using recently cached web results…")
             return cached[1]
-    result = research_web(query)
+    result = research_web(query, cancel=cancel, progress=progress)
     if isinstance(result, str) and "Source:" in result:
         with _cache_lock:
             if len(_cache) >= 64:

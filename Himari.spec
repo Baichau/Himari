@@ -73,6 +73,9 @@ hiddenimports = [
     "winrt.windows.graphics.imaging",
     "winrt.windows.media.ocr",
     "winrt.windows.storage.streams",
+    "pywinauto",
+    "comtypes",
+    "psutil",
 ]
 
 datas += collect_data_files("_sounddevice_data")
@@ -85,6 +88,7 @@ for package in (
     "av",
     "winrt",
     "playwright",
+    "pywinauto",
 ):
     collected_datas, collected_binaries, collected_imports = collect_all(package)
     datas += collected_datas

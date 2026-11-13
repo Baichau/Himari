@@ -6,16 +6,24 @@ from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBo
  QLineEdit,QPushButton,QLabel,QListWidget,QListWidgetItem,QCheckBox,QComboBox,QSlider,QTabWidget,
  QInputDialog,QFileDialog,QMessageBox,QSystemTrayIcon,QMenu,QScrollArea,QFrame,QSizePolicy,
  QSpinBox)
-from PySide6.QtCore import Qt, Signal, QTimer
-from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter
+from PySide6.QtCore import Qt, Signal, QTimer, QUrl
+from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QDesktopServices
 from .config import load, save
-from . import db, persona, chat_web, theme
+from .paths import user_data_dir
+from . import db, persona, chat_web, theme, ui_effects, ui_settings
 from .agent import AgentOrchestrator, CancellationToken
 from .control import dashboard as control_dashboard
 from .control import diagnostics as control_diagnostics
-from .memory import MemoryManager, retrieve as retrieve_memories
+from .control import settings as control_settings
+from .memory import CATEGORIES, MemoryManager, retrieve as retrieve_memories, summarize_older
 from .personality import load_persona
-from .security import SecurityLayer
+from .security import (
+    SecurityLayer,
+    new_decision,
+    release_pending_confirmations,
+    resolve_decision,
+    wait_for_decision,
+)
 from .avatar import AvatarWidget, FloatingAvatarWindow
 from .llm import LLM, LLMCancelled
 from .research import research_for_prompt, should_research
@@ -38,12 +46,20 @@ def app_icon():
     return QIcon(str(path)) if path.is_file() else QIcon()
 
 
+def _chord_value(widget, fallback):
+    reader = getattr(widget, "currentChord", None)
+    try:
+        value = reader() if callable(reader) else widget.text()
+    except Exception:
+        value = ""
+    return str(value or "").strip() or fallback
+
+
 class UI(QMainWindow):
     token=Signal(str); status=Signal(str); done=Signal(str); tool=Signal(str)
     failed=Signal(str); cancelled=Signal(str)
     voice_result=Signal(str); screen_error=Signal(str)
     screenshot_ready=Signal(object,str); screenshot_error=Signal(str)
-    image_ready=Signal(str)
     ollama_checked=Signal(object)
     hotkey_pressed=Signal(); screen_hotkey_pressed=Signal(); confirmation_requested=Signal(object)
     auto_stop_requested=Signal(); wake_word_detected_signal=Signal(str)
@@ -90,6 +106,8 @@ class UI(QMainWindow):
         self._ollama_check_running = False
         self._preload_running = False
         self._preload_done = False
+        self._summary_running = False
+        self._summary_at = 0
         self.agent_running = False
         self._agent_token = None
         self._dashboard_running = False
@@ -110,7 +128,6 @@ class UI(QMainWindow):
         self.voice_result.connect(self._apply_voice_text)
         self.screenshot_ready.connect(self._screenshot_ready)
         self.screenshot_error.connect(self._screen_failed)
-        self.image_ready.connect(self._show_generated_image)
         self.hotkey_pressed.connect(self.toggle_mic)
         self.screen_hotkey_pressed.connect(self.screen_query)
         self.confirmation_requested.connect(self._confirm_tool)
@@ -121,7 +138,7 @@ class UI(QMainWindow):
         self.diagnostics_ready.connect(self._apply_diagnostics)
         self.agent_status.connect(self._agent_progress)
         self.agent_finished.connect(self._agent_done)
-        self.tabs=QTabWidget(); tabs=self.tabs; self.setCentralWidget(tabs)
+        self.tabs=ui_effects.AnimatedTabWidget(); tabs=self.tabs; self.setCentralWidget(tabs)
         # Chat tab
         chat=QWidget(); root=QHBoxLayout(chat)
         root.setContentsMargins(14,14,14,14); root.setSpacing(14)
@@ -222,6 +239,8 @@ class UI(QMainWindow):
             theme_name=self.theme_name,
             engine=str(cfg.get("ui", {}).get("chat_engine", "web")),
         )
+        if hasattr(self.chat, "fillRequested"):
+            self.chat.fillRequested.connect(self._fill_from_welcome)
         self.chat.render_messages(
             [], assistant_name=self.assistant_name, force_scroll=True
         )
@@ -260,6 +279,11 @@ class UI(QMainWindow):
         row2.addWidget(self.send_btn)
         row2.addWidget(self.stop_generation_btn)
         main.addLayout(row2)
+        self.shortcut_hint=QLabel("")
+        self.shortcut_hint.setObjectName("MutedLine")
+        main.addWidget(self.shortcut_hint)
+        self.input.textChanged.connect(self._refresh_send_button)
+        self._refresh_send_button()
         root.addLayout(main, 1)
         tabs.addTab(chat,"Chat")
         # Dashboard tab
@@ -289,16 +313,29 @@ class UI(QMainWindow):
         tabs.addTab(activity_tab,"Activity")
         # Memory tab
         mem=QWidget(); mv=QVBoxLayout(mem)
+        search_row=QHBoxLayout()
         self.memory_search=QLineEdit()
         self.memory_search.setPlaceholderText("Search saved memories")
         self.memory_search.textChanged.connect(self.refresh_mem)
-        mv.addWidget(self.memory_search)
+        self.memory_filter=QComboBox()
+        self.memory_filter.addItem("All categories", "")
+        for category in CATEGORIES:
+            self.memory_filter.addItem(category.replace("_", " ").title(), category)
+        self.memory_filter.currentIndexChanged.connect(self.refresh_mem)
+        search_row.addWidget(self.memory_search,1)
+        search_row.addWidget(self.memory_filter)
+        mv.addLayout(search_row)
         self.mem_list=QListWidget(); mv.addWidget(self.mem_list)
         mrow=QHBoxLayout()
         add=QPushButton("Add"); add.clicked.connect(self.add_mem)
         edit=QPushButton("Edit"); edit.clicked.connect(self.edit_mem)
         dele=QPushButton("Delete"); dele.clicked.connect(self.del_mem)
-        for b in [add,edit,dele]: mrow.addWidget(b)
+        conflicts=QPushButton("Check contradictions")
+        conflicts.setToolTip(
+            "Look for saved memories that appear to disagree. Nothing is changed automatically."
+        )
+        conflicts.clicked.connect(self.check_memory_conflicts)
+        for b in [add,edit,dele,conflicts]: mrow.addWidget(b)
         mv.addLayout(mrow)
         mv.addWidget(QLabel("Memory suggestions (review before saving):"))
         self.suggestion_list=QListWidget(); mv.addWidget(self.suggestion_list)
@@ -310,206 +347,8 @@ class UI(QMainWindow):
         suggestion_row.addWidget(approve); suggestion_row.addWidget(reject)
         mv.addLayout(suggestion_row); self.memory_tab_index=tabs.addTab(mem,"Memory")
         # Settings tab
-        st=QWidget(); sv=QVBoxLayout(st)
-        self.cb_store=QCheckBox("Store conversations locally"); self.cb_store.setChecked(load()["privacy"]["store_conversations"])
-        self.cb_auto_memory=QCheckBox("Create pending memory suggestions on explicit requests")
-        self.cb_auto_memory.setChecked(load()["privacy"].get("auto_memory", True))
-        self.cb_apps=QCheckBox("Allow opening apps and Steam games"); self.cb_apps.setChecked(load()["permissions"]["allow_open_app"])
-        self.cb_web=QCheckBox("Allow opening websites"); self.cb_web.setChecked(load()["permissions"]["allow_open_url"])
-        self.cb_research=QCheckBox("Automatically check the web for factual questions")
-        self.cb_research.setChecked(load()["permissions"].get("allow_web_research", True))
-        self.cb_research.setToolTip(
-            "Quietly checks public sources for questions about people, games, media, "
-            "places, events, and other facts before answering. Search terms are sent "
-            "to DuckDuckGo; no browser window is opened."
-        )
-        self.cb_screen=QCheckBox("Allow one-time screen capture (asks for confirmation each time)")
-        self.cb_screen.setChecked(load()["permissions"].get("allow_screen_capture", True))
-        self.cb_active_window=QCheckBox("Allow requested active-window detection")
-        self.cb_active_window.setChecked(load()["permissions"].get("allow_active_window", False))
-        self.cb_media=QCheckBox("Allow Windows media controls (may affect the active media app)")
-        self.cb_media.setChecked(load()["permissions"].get("allow_media_control", False))
-        self.cb_browser=QCheckBox("Allow browser automation (Himari opens its own Chrome window)")
-        self.cb_browser.setChecked(load()["permissions"].get("allow_browser_automation", False))
-        self.cb_browser.setToolTip(
-            "Lets Himari search, open results, read pages, and manage tabs in its own "
-            "visible Chrome window. That window uses a separate profile without your "
-            "saved logins, and your everyday Chrome tabs are never touched. Payments "
-            "and logins are refused. Disabled by default."
-        )
-        self.cb_memory_enabled=QCheckBox("Enable long-term memory")
-        self.cb_memory_enabled.setChecked(load()["privacy"].get("memory_enabled", True))
-        self.cb_cmd=QCheckBox("Allow shell commands (disabled for safety)")
-        self.cb_cmd.setChecked(False)
-        self.cb_cmd.setEnabled(False)
-        self.cb_cmd.setToolTip(
-            "Himari uses dedicated permission-checked tools "
-            "instead of arbitrary shell execution."
-        )
-        self.cb_write=QCheckBox("Allow file writes"); self.cb_write.setChecked(load()["permissions"]["allow_write_file"])
-        self.cb_wake=QCheckBox("Enable wake-word listening (Himari)"); self.cb_wake.setChecked(load()["voice"].get("wake_word_enabled",False))
-        self.cb_wake.toggled.connect(self._toggle_wake_word)
-        self.cb_always_on_top=QCheckBox("Always on top"); self.cb_always_on_top.setChecked(load()["ui"].get("always_on_top",False))
-        self.cb_always_on_top.toggled.connect(self._set_always_on_top)
-        self.cb_minimize_to_tray=QCheckBox("Minimize to tray"); self.cb_minimize_to_tray.setChecked(load()["ui"].get("minimize_to_tray",True))
-        self._set_always_on_top(self.cb_always_on_top.isChecked())
-        self.allowed_folders=QListWidget()
-        self.allowed_folders.addItems(load()["permissions"].get("allowed_folders",[]))
-        folder_row=QHBoxLayout()
-        add_folder=QPushButton("Add allowed folder")
-        add_folder.clicked.connect(self.add_allowed_folder)
-        remove_folder=QPushButton("Remove selected folder")
-        remove_folder.clicked.connect(lambda:self.allowed_folders.takeItem(self.allowed_folders.currentRow())
-                                      if self.allowed_folders.currentRow()>=0 else None)
-        folder_row.addWidget(add_folder); folder_row.addWidget(remove_folder)
-        self.mic_box=QComboBox()
-        self.mic_box.addItem("System default",None)
-        try:
-            import sounddevice as sd
-            selected_device=load()["voice"].get("microphone_device")
-            for index,device in enumerate(sd.query_devices()):
-                if device["max_input_channels"]>0:
-                    self.mic_box.addItem(f"{index}: {device['name']}",index)
-                    if index==selected_device: self.mic_box.setCurrentIndex(self.mic_box.count()-1)
-        except Exception as e: log.warning("Microphone list unavailable: %s",e)
-        self.voice_box=QComboBox()
-        available_voices = TTS().available_voices()
-        configured_voice = load()["voice"].get("tts_voice")
-        if (
-            configured_voice == "en_US-lessac-medium"
-            and "en_US-amy-medium" in available_voices
-        ):
-            configured_voice = "en_US-amy-medium"
-        self.voice_box.addItems(available_voices or [configured_voice or "en_US-amy-medium"])
-        if configured_voice in [self.voice_box.itemText(i) for i in range(self.voice_box.count())]:
-            self.voice_box.setCurrentText(configured_voice)
-        self.model_box=QComboBox()
-        configured_model=load()["ollama"]["chat_model"]
-        self.model_box.addItems(dict.fromkeys(["qwen3:8b",configured_model]))
-        self.model_box.setCurrentText(configured_model)
-        self.ollama_host=QLineEdit(load()["ollama"].get("host", "http://127.0.0.1:11434"))
-        self.reply_wait=QSpinBox()
-        self.reply_wait.setRange(60, 1800)
-        self.reply_wait.setSingleStep(60)
-        self.reply_wait.setSuffix(" s")
-        self.reply_wait.setValue(
-            int(load()["ollama"].get("stream_timeout_seconds", 900))
-        )
-        self.reply_wait.setToolTip(
-            "How long Himari waits for one reply, including the first model load. "
-            "The Stop button still cancels immediately."
-        )
-        self.cb_preload=QCheckBox("Preload the chat model at startup (faster first reply)")
-        self.cb_preload.setChecked(load()["ollama"].get("preload_model", True))
-        self.cb_preload.setToolTip(
-            "Loads the already-installed local model into Ollama memory when Himari "
-            "starts. Nothing is downloaded."
-        )
-        self.cb_deep_reasoning=QCheckBox("Think deeply for factual questions (slower, more accurate)")
-        self.cb_deep_reasoning.setChecked(
-            load()["ollama"].get("deep_reasoning", True)
-        )
-        self.cb_deep_reasoning.setToolTip(
-            "Lets the local model reason step by step before answering questions "
-            "that need web research. Replies take longer but are more accurate; "
-            "greetings and quick tasks stay fast."
-        )
-        self.cb_vision=QCheckBox("Let the local vision model read attached or captured images")
-        self.cb_vision.setChecked(load()["permissions"].get("allow_vision", True))
-        self.cb_vision.setToolTip(
-            "Images go to your local Ollama vision model only when you press Send. "
-            "Nothing is uploaded to a cloud service."
-        )
-        self.cb_imagegen=QCheckBox("Generate images with the built-in local image engine")
-        self.cb_imagegen.setChecked(
-            load()["permissions"].get("allow_image_generation", True)
-        )
-        self.cb_imagegen.setToolTip(
-            "The portable release carries its own Stable Diffusion engine and "
-            "unpacks it on first use. An A1111-compatible server on this PC "
-            "also works. Nothing is uploaded."
-        )
-        self.vision_model_box=QComboBox()
-        self.vision_model_box.setEditable(True)
-        configured_vision=load()["ollama"].get("vision_model") or "qwen2.5vl:3b"
-        self.vision_model_box.addItems(
-            dict.fromkeys(["qwen2.5vl:3b", configured_vision])
-        )
-        self.vision_model_box.setCurrentText(configured_vision)
-        self.vision_model_box.setToolTip(
-            "Ollama vision-language model used to read screenshots and photos. "
-            "Install it with: ollama pull qwen2.5vl:3b"
-        )
-        self.imagegen_host=QLineEdit(
-            load().get("imagegen", {}).get("base_url", "http://127.0.0.1:8080")
-        )
-        self.imagegen_host.setToolTip(
-            "A1111-compatible API of the local image generator. "
-            "stable-diffusion.cpp sd-server defaults to 8080, "
-            "Automatic1111/Forge to 7860."
-        )
-        self.chat_engine_box=QComboBox()
-        self.chat_engine_box.addItem("Rich (math, diagrams, tables)", "web")
-        self.chat_engine_box.addItem("Classic (plain text)", "classic")
-        self.chat_engine_box.setCurrentIndex(
-            max(0, self.chat_engine_box.findData(load()["ui"].get("chat_engine", "web")))
-        )
-        self.chat_engine_box.setToolTip(
-            "Rich mode draws Markdown, formulas and Mermaid diagrams in an embedded "
-            "browser view. Changes apply after restarting Himari."
-        )
-        self.lang_box=QComboBox()
-        self.lang_box.addItem("Automatic", "auto")
-        self.lang_box.addItem("English", "en")
-        self.lang_box.addItem("Russian", "ru")
-        current_lang = (load()["voice"].get("recognition_language") or load()["voice"].get("language") or "en").lower()
-        language_code = "ru" if current_lang.startswith("ru") else "en" if current_lang.startswith("en") else "auto"
-        self.lang_box.setCurrentIndex(self.lang_box.findData(language_code))
-        self.sensitivity=QSlider(Qt.Horizontal); self.sensitivity.setRange(10,100); self.sensitivity.setValue(int(float(load()["voice"].get("sensitivity",0.75))*100))
-        self.wake_word_field=QLineEdit(load()["voice"].get("wake_word","Himari"))
-        self.vol=QSlider(Qt.Horizontal); self.vol.setRange(0,100); self.vol.setValue(int(load()["voice"]["volume"]*100))
-        self.hotkey=QLineEdit(load()["voice"]["push_to_talk_key"])
-        self.screen_hotkey=QLineEdit(load().get("screen", {}).get("capture_hotkey", "f10"))
-        self.screen_hotkey.textChanged.connect(
-            lambda key:self.analyze_btn.setText(f"Screen ({key.strip().upper() or 'F10'})")
-        )
-        self.hotkey.textChanged.connect(
-            lambda key:self.mic_btn.setText(self._talk_label(key))
-        )
-        for w in [self.cb_store,self.cb_auto_memory,self.cb_memory_enabled,self.cb_apps,self.cb_web,
-                  self.cb_research,self.cb_screen,
-                  self.cb_active_window,self.cb_media,self.cb_browser,
-                  self.cb_cmd,self.cb_write,self.cb_wake,
-                  self.cb_always_on_top,self.cb_minimize_to_tray,
-                  QLabel("Folders available to file tools:"),self.allowed_folders]: sv.addWidget(w)
-        sv.addLayout(folder_row)
-        for w in [QLabel("Microphone:"),self.mic_box,
-                  QLabel("Recognition language:"),self.lang_box,
-                  QLabel("Wake word:"),self.wake_word_field,
-                  QLabel("Wake-word sensitivity:"),self.sensitivity,
-                  QLabel("Voice (English default; Russian falls back to Windows):"),self.voice_box,
-                  QLabel("Ollama server URL:"),self.ollama_host,
-                  QLabel("Chat model:"),self.model_box,
-                  QLabel("Vision model:"),self.vision_model_box,
-                  self.cb_vision,
-                  QLabel("Reply wait limit (seconds):"),self.reply_wait,
-                  self.cb_preload,
-                  self.cb_deep_reasoning,
-                  QLabel("Image generator URL:"),self.imagegen_host,
-                  self.cb_imagegen,
-                  QLabel("Chat rendering:"),self.chat_engine_box,
-                  QLabel("TTS volume:"),self.vol,QLabel("Push-to-talk key:"),self.hotkey,
-                  QLabel("Global screen-capture key:"),self.screen_hotkey]: sv.addWidget(w)
-        sv.addSpacing(12)
-        sv.addWidget(QLabel("Local data:"))
-        self.clear_history_btn=QPushButton("Clear all chat history…")
-        self.clear_history_btn.setObjectName("StopButton")
-        self.clear_history_btn.setToolTip("Deletes chats and summaries; saved memories and settings stay")
-        self.clear_history_btn.clicked.connect(self.clear_all_history)
-        sv.addWidget(self.clear_history_btn)
-        sv.addStretch()
-        settings_scroll=QScrollArea(); settings_scroll.setWidgetResizable(True)
-        settings_scroll.setWidget(st); tabs.addTab(settings_scroll,"Settings")
+        settings_scroll=ui_settings.build_settings_page(self)
+        self.settings_tab_index=tabs.addTab(settings_scroll,"Settings")
         diag=QWidget(); dv2=QVBoxLayout(diag)
         self.diag_btn=QPushButton("Run diagnostics"); self.diag_btn.clicked.connect(self.run_diagnostics)
         self.diag_text=QTextEdit(); self.diag_text.setReadOnly(True)
@@ -525,6 +364,11 @@ class UI(QMainWindow):
         self._bind_hotkeys()
         if self.cb_wake.isChecked():
             self._toggle_wake_word(True)
+        self._settings_save_timer=QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(600)
+        self._settings_save_timer.timeout.connect(self._autosave_settings)
+        self._connect_settings_autosave()
     # ---- chat shell -------------------------------------------------
     def _talk_label(self, key=None):
         if key is None:
@@ -547,7 +391,9 @@ class UI(QMainWindow):
         label = getattr(self, "_waiting_label", "Waiting for Ollama…")
         if elapsed >= 60:
             message = "Still working — you can press Stop."
-        elif elapsed >= 20 and label == "Waiting for Ollama…":
+        elif elapsed >= 20 and (
+            label == "Waiting for Ollama…" or "waking the local model" in label.casefold()
+        ):
             message = "Still loading the local model…"
         else:
             message = label
@@ -579,12 +425,43 @@ class UI(QMainWindow):
             cfg = load()
         except Exception:
             return
+        talk_key = (cfg.get("voice") or {}).get("push_to_talk_key")
+        capture_key = (cfg.get("screen") or {}).get("capture_hotkey")
         if getattr(self, "mic_btn", None) is not None:
             recording = bool(getattr(self, "mic", None) and self.mic.rec)
             self.mic_btn.setText(
-                "Stop & Transcribe" if recording
-                else self._talk_label((cfg.get("voice") or {}).get("push_to_talk_key"))
+                "Stop & Transcribe" if recording else self._talk_label(talk_key)
             )
+        if getattr(self, "analyze_btn", None) is not None:
+            key = str(capture_key or "").strip().upper()
+            self.analyze_btn.setText(f"Screen ({key})" if key else "Screen")
+        self._update_shortcut_hint(talk_key, capture_key)
+    def _update_shortcut_hint(self, talk_key=None, capture_key=None):
+        hint = getattr(self, "shortcut_hint", None)
+        if hint is None:
+            return
+        if talk_key is None or capture_key is None:
+            try:
+                cfg = load()
+            except Exception:
+                cfg = {}
+            talk_key = (cfg.get("voice") or {}).get("push_to_talk_key", talk_key)
+            capture_key = (cfg.get("screen") or {}).get("capture_hotkey", capture_key)
+        parts = ["Enter to send"]
+        if str(talk_key or "").strip():
+            parts.append(f"{str(talk_key).upper()} to talk")
+        if str(capture_key or "").strip():
+            parts.append(f"{str(capture_key).upper()} to capture")
+        parts.append("drop files in anytime")
+        hint.setText("   ·   ".join(parts))
+    def _fill_from_welcome(self, text):
+        text = str(text or "").strip()
+        if not text or not hasattr(self, "input"):
+            return
+        self.input.setText(text)
+        self.input.setCursorPosition(len(text))
+        self.input.setFocus()
+        ui_effects.pulse(self.input, duration=360, low=0.55)
     def _restore_last_session(self):
         try:
             recent = db.sessions(limit=1)
@@ -693,17 +570,45 @@ class UI(QMainWindow):
                 db.add_message(self.session, role, content)
         except Exception as exc:
             log.warning("Could not save chat message: %s", exc)
+    def _maybe_summarize(self):
+        if self._summary_running:
+            return
+        try:
+            total = db.message_count(self.session)
+        except Exception:
+            return
+        if total < 48 or total - self._summary_at < 24:
+            return
+        self._summary_at = total
+        self._summary_running = True
+        session = self.session
+
+        def work():
+            try:
+                summarize_older(session, keep_recent=32)
+            except Exception as exc:
+                log.warning("Conversation summarization failed: %s", exc)
+            finally:
+                self._summary_running = False
+
+        threading.Thread(target=work, daemon=True).start()
     def _finish_generation(self):
         self._stop_waiting()
-        self.send_btn.setEnabled(True)
         self.stop_generation_btn.setEnabled(True)
         self.stop_generation_btn.setVisible(False)
         self.input.setEnabled(True)
         self.input.setFocus()
+        self._refresh_send_button()
+    def _refresh_send_button(self, *_):
+        if not hasattr(self, "send_btn") or not hasattr(self, "input"):
+            return
+        ready = bool(self.input.text().strip() or getattr(self, "_attachments", []))
+        self.send_btn.setEnabled(bool(ready and not getattr(self, "busy", False)))
     def stop_generation(self):
         if not self.busy:
             return
         self._cancel_event.set()
+        self._release_confirmations()
         timer = getattr(self, "_wait_timer", None)
         if timer is not None:
             timer.stop()
@@ -765,10 +670,14 @@ class UI(QMainWindow):
         if self._ollama_check_running:
             return
         self._ollama_check_running = True
-        threading.Thread(
-            target=lambda:self.ollama_checked.emit(self.llm.model_status()),
-            daemon=True,
-        ).start()
+
+        def probe():
+            result = self.llm.model_status()
+            if result[1] is None:
+                self.llm.refresh_capabilities()
+            self.ollama_checked.emit(result)
+
+        threading.Thread(target=probe, daemon=True).start()
     def _preload_model(self):
         if self._preload_running or self._preload_done or self.busy:
             return
@@ -779,12 +688,16 @@ class UI(QMainWindow):
         if not enabled:
             return
         self._preload_running = True
+        if not self.busy:
+            self._status("Warming up the local model — first reply will be quicker…")
         threading.Thread(target=self._preload_worker, daemon=True).start()
     def _preload_worker(self):
         try:
             self.llm.preload()
             self._preload_done = True
             log.info("Chat model preloaded into Ollama memory")
+            if not self.busy:
+                self._status("Ready — the local model is warm.")
         except Exception as exc:
             log.info("Chat model preload skipped: %s", exc)
         finally:
@@ -851,7 +764,13 @@ class UI(QMainWindow):
             "Error": "error",
         }.get(state, "idle")
         self.avatar.set_state(avatar_state)
+        self.avatar.set_accent(color)
         self.floating_avatar.set_state(avatar_state)
+        self.floating_avatar.avatar.set_accent(color)
+        if getattr(self, "_avatar_state_name", None) != state:
+            self._avatar_state_name = state
+            if state != "Idle":
+                ui_effects.pulse(self.avatar_state, duration=420, low=0.45)
     def _flash_expression(self, state, delay_ms=1800):
         self._set_avatar_state(state)
         def reset():
@@ -944,6 +863,29 @@ class UI(QMainWindow):
         if folder and not any(self.allowed_folders.item(i).text()==folder
                               for i in range(self.allowed_folders.count())):
             self.allowed_folders.addItem(folder)
+    def add_development_workspace(self):
+        folder=QFileDialog.getExistingDirectory(self,"Choose a development workspace")
+        if folder and not any(self.development_workspaces.item(i).text()==folder
+                              for i in range(self.development_workspaces.count())):
+            self.development_workspaces.addItem(folder)
+    def open_log_folder(self):
+        folder=user_data_dir()/"logs"
+        try:
+            folder.mkdir(parents=True,exist_ok=True)
+        except OSError as exc:
+            self._status(f"Could not open the log folder: {exc}")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+    def open_log_viewer(self):
+        from .log_viewer import LogViewerDialog
+        viewer=getattr(self,"_log_viewer",None)
+        if viewer is None:
+            viewer=LogViewerDialog(self)
+            self._log_viewer=viewer
+        viewer.refresh()
+        viewer.show()
+        viewer.raise_()
+        viewer.activateWindow()
     def _token(self,t):
         if not self.busy:
             return
@@ -986,6 +928,7 @@ class UI(QMainWindow):
                 self.retry_btn.setVisible(True)
         self._render_chat(force_scroll=True)
         self._load_sessions(select=self.session)
+        self._maybe_summarize()
         self._flash_expression("Happy")
         self._speak(content)
     def _cancelled(self, partial):
@@ -1108,8 +1051,10 @@ class UI(QMainWindow):
             row.addWidget(remove)
             self.attachments_row.addWidget(chip)
             self._attachment_widgets.append(chip)
+            ui_effects.fade_in(chip, duration=180, start=0.0)
         self.attachments_row.addStretch(1)
         self.attachments_widget.setVisible(bool(self._attachments))
+        self._refresh_send_button()
 
     def _remove_attachment(self, index):
         if 0 <= index < len(self._attachments):
@@ -1133,15 +1078,6 @@ class UI(QMainWindow):
         if paths:
             self._add_attachment_paths(paths)
             event.acceptProposedAction()
-
-    def _show_generated_image(self, path):
-        if not path:
-            return
-        self._append_message(
-            "assistant", "", image=str(path), caption="Generated image"
-        )
-        self._render_chat(force_scroll=True)
-        self._status(f"Image saved to {path}")
 
     def send(self, screen_context=None):
         if self.busy:
@@ -1202,7 +1138,13 @@ class UI(QMainWindow):
         elif should_research(text):
             self._waiting_label = "Checking the web for reliable sources…"
         else:
-            self._waiting_label = "Waiting for Ollama…"
+            ollama_cfg = load().get("ollama", {})
+            first_load = bool(ollama_cfg.get("preload_model", True)) and not self._preload_done
+            self._waiting_label = (
+                "Waking the local model — the first reply can take a little longer…"
+                if first_load
+                else "Waiting for Ollama…"
+            )
         self._start_waiting()
         threading.Thread(
             target=self._prepare_and_run,
@@ -1271,11 +1213,22 @@ class UI(QMainWindow):
             deep_reasoning = bool(
                 load().get("ollama", {}).get("deep_reasoning", True)
             )
-            think = deep_reasoning and (needs_research or bool(image_atts))
+            think = deep_reasoning and (
+                needs_research or bool(image_atts) or persona.should_think(text)
+            )
+            self._waiting_label = (
+                "Thinking deeply about this…"
+                if think
+                else "Thinking through your question…"
+            )
             research = None
             if needs_research:
                 self.status.emit("Checking the web for reliable sources…")
-                research = research_for_prompt(text)
+                research = research_for_prompt(
+                    text,
+                    cancel=cancel_event,
+                    progress=self.status.emit,
+                )
                 if cancel_event.is_set():
                     self.cancelled.emit("")
                     return
@@ -1325,6 +1278,7 @@ class UI(QMainWindow):
                 research=research,
                 attachments=attachment_block,
                 vision=vision_text,
+                directive=persona.diagram_directive(text),
             )
         except Exception as exc:
             log.exception("Chat preparation failed")
@@ -1360,7 +1314,6 @@ class UI(QMainWindow):
                 cancel_event=cancel_event,
                 on_status=self.status.emit,
                 think=think,
-                on_image=self.image_ready.emit,
             )
             self.done.emit("".join(out))
         except LLMCancelled as exc:
@@ -1368,12 +1321,16 @@ class UI(QMainWindow):
         except Exception as e:
             self.failed.emit(f"LLM error: {e}")
     def _confirm_security_action(self, name, args, message):
-        result={"allowed":False,"event":threading.Event()}
+        result=new_decision()
         self.confirmation_requested.emit((name,args,message,result))
-        result["event"].wait()
-        return result["allowed"]
+        allowed = wait_for_decision(result)
+        if not allowed and not result["event"].is_set():
+            self._status("The confirmation timed out, so the action was not allowed.")
+        return allowed
     def _confirm_tool(self,request):
         name,args,message,result=request
+        if result["event"].is_set():
+            return
         if name == "write_desktop_file":
             content = args.get("content", "")
             details = (
@@ -1383,10 +1340,23 @@ class UI(QMainWindow):
             )
         else:
             details = str(args)
-        answer=QMessageBox.question(self,"Confirm Himari action",
-            f"{message}\n\n{name}:\n{details}",QMessageBox.Yes|QMessageBox.No,QMessageBox.No)
-        result["allowed"]=answer==QMessageBox.Yes
-        result["event"].set()
+        box=QMessageBox(self)
+        box.setWindowTitle("Confirm Himari action")
+        box.setText(f"{message}\n\n{name}:\n{details}")
+        box.setIcon(QMessageBox.Question)
+        box.setStandardButtons(QMessageBox.Yes|QMessageBox.No)
+        box.setDefaultButton(QMessageBox.No)
+        self._confirm_box=box
+        try:
+            answer=box.exec()
+        finally:
+            self._confirm_box=None
+        resolve_decision(result, answer==QMessageBox.Yes)
+    def _release_confirmations(self):
+        box=getattr(self,"_confirm_box",None)
+        if box is not None:
+            box.reject()
+        release_pending_confirmations()
     def _failed(self,message):
         self.busy=False
         partial = str(self._streamed_response or "").strip()
@@ -1427,6 +1397,7 @@ class UI(QMainWindow):
             ).start()
         else:
             try:
+                self.tts.stop()
                 self.mic.start(on_silence=None)
                 self.mic_btn.setText("Stop & Transcribe")
                 self._status("Listening… click Stop & Transcribe when you’re done.")
@@ -1471,6 +1442,7 @@ class UI(QMainWindow):
         self.input.setFocus()
         if not self.mic.rec:
             try:
+                self.tts.stop()
                 self.mic.start(on_silence=self.auto_stop_requested.emit)
                 self.mic_btn.setText("Stop & Transcribe")
             except Exception as exc:
@@ -1489,14 +1461,42 @@ class UI(QMainWindow):
             self._status("Screen capture is disabled in Settings.")
             return
 
+        screen_cfg = load().get("screen", {}) or {}
+        area_widget = getattr(self, "screen_area", None)
+        try:
+            chosen = area_widget.currentData() if area_widget is not None else None
+        except Exception:
+            chosen = None
+        target = str(chosen or screen_cfg.get("monitor") or "primary").strip().casefold()
+        region = getattr(self, "_screen_region", None) if target == "region" else None
+        if target == "region" and not region:
+            self._status(
+                "Choose a custom region in Settings first, or switch the capture "
+                "area back to the primary screen."
+            )
+            return
+        if target == "active" and not self.cb_active_window.isChecked():
+            self._status(
+                "Active-window capture is disabled in Settings. Enable it or "
+                "choose another capture area."
+            )
+            return
+        target_text = {
+            "primary": "your primary screen",
+            "all": "all of your screens",
+            "active": "your active window",
+            "region": "the selected screen region",
+        }.get(target, f"screen {target}")
+
         answer = QMessageBox.question(
             self,
             "Allow one-time screen capture?",
             (
-                "Himari will capture your primary screen once and attach it to "
-                "your message so you can ask about it.\n\n"
-                "The image is sent to your local vision model only when you "
-                "press Send, and it is never saved to disk.\n\n"
+                f"Himari will capture {target_text} once and attach it to your "
+                "message so you can ask about it.\n\n"
+                "It is read locally when you press Send — by the local vision "
+                "model, or by on-device OCR when that model is unavailable — "
+                "and it is never saved to disk.\n\n"
                 "Continue?"
             ),
             QMessageBox.Yes | QMessageBox.No,
@@ -1506,28 +1506,36 @@ class UI(QMainWindow):
         if answer != QMessageBox.Yes:
             self._status("Screen capture cancelled.")
             return
+        if not self._save_settings(interactive=False):
+            self._status("Screen capture cancelled because the settings could not be saved.")
+            return
 
         question = self.input.text().strip()
         self.analyze_btn.setEnabled(False)
-        self._status("Capturing the primary screen…")
+        self._status(f"Capturing {target_text}…")
 
         def work():
             try:
+                from .perception.capture import capture_screen
                 from .perception.scene import active_window_info
-                from .screen import capture
 
-                image = capture()
+                image = capture_screen(
+                    region=region,
+                    monitor=None if target in ("primary", "region") else target,
+                    active_window=target == "active",
+                )
                 try:
                     attachment = image_attachment(
                         image,
                         name=f"screen-{datetime.now():%Y%m%d-%H%M%S}.png",
-                        meta={"source": "screen"},
+                        meta={"source": "screen", "target": target},
                     )
-                    title, application = active_window_info()
-                    if title:
-                        attachment.meta["window"] = (
-                            f"{application} — {title}" if application else title
-                        )
+                    if target == "active":
+                        title, application = active_window_info()
+                        if title:
+                            attachment.meta["window"] = (
+                                f"{application} — {title}" if application else title
+                            )
                 finally:
                     image.close()
                 self.screenshot_ready.emit(attachment, question)
@@ -1667,16 +1675,25 @@ class UI(QMainWindow):
             self._status("That memory is already saved.")
     def refresh_mem(self):
         query=self.memory_search.text().strip().casefold()
+        category=self.memory_filter.currentData() if hasattr(self,"memory_filter") else ""
         self.mem_list.clear()
         for m in db.memories():
-            if not query or query in m["text"].casefold():
-                self.mem_list.addItem(f"{m['id'][:8]} — {m['text']}")
+            text=str(m.get("text") or "")
+            if query and query not in text.casefold():
+                continue
+            if category and (m.get("category") or "personal_context") != category:
+                continue
+            label=(m.get("category") or "personal_context").replace("_"," ")
+            item=QListWidgetItem(f"{label} · {text}")
+            item.setData(Qt.UserRole, m["id"])
+            item.setToolTip(text)
+            self.mem_list.addItem(item)
         self.suggestion_list.clear()
         suggestions=db.memory_suggestions()
         for suggestion in suggestions:
-            self.suggestion_list.addItem(
-                f"{suggestion['id'][:8]} — {suggestion['text']}"
-            )
+            item=QListWidgetItem(f"{suggestion['id'][:8]} — {suggestion['text']}")
+            item.setData(Qt.UserRole, suggestion["id"])
+            self.suggestion_list.addItem(item)
         tabs=getattr(self,"tabs",None)
         if tabs is not None and getattr(self,"memory_tab_index",None) is not None:
             tabs.setTabText(
@@ -1684,9 +1701,15 @@ class UI(QMainWindow):
                 f"Memory ({len(suggestions)})" if suggestions else "Memory",
             )
     def _selected_memory_suggestion(self):
-        row=self.suggestion_list.currentRow()
+        item=self.suggestion_list.currentItem()
+        if item is None:
+            return None
+        memory_id=item.data(Qt.UserRole)
         suggestions=db.memory_suggestions()
-        return suggestions[row] if 0 <= row < len(suggestions) else None
+        return next(
+            (suggestion for suggestion in suggestions if suggestion["id"]==memory_id),
+            None,
+        )
     def approve_memory_suggestion(self):
         suggestion=self._selected_memory_suggestion()
         if suggestion:
@@ -1765,10 +1788,9 @@ class UI(QMainWindow):
         self._set_avatar_state("Working")
         token = self._agent_token
         def confirm(name, args, message):
-            result={"allowed":False,"event":threading.Event()}
+            result=new_decision()
             self.confirmation_requested.emit((name,args,message,result))
-            result["event"].wait()
-            return result["allowed"]
+            return wait_for_decision(result)
         def work():
             try:
                 orchestrator = AgentOrchestrator(
@@ -1786,10 +1808,14 @@ class UI(QMainWindow):
     def cancel_agent_task(self):
         if self._agent_token is not None:
             self._agent_token.cancel()
+            self._release_confirmations()
             self.agent_status_label.setText("Agent: cancelling…")
     def _agent_progress(self, event):
         self.agent_status_label.setText(f"Agent: {event['status']} — {event['detail']}")
-        if event["status"] in ("planning", "executing", "verifying"):
+        if event["status"] in (
+            "understanding", "planning", "waiting_for_permission",
+            "executing", "observing", "verifying",
+        ):
             self._set_avatar_state("Working")
     def _agent_done(self, state):
         self.agent_running = False
@@ -1797,10 +1823,20 @@ class UI(QMainWindow):
         self._agent_token = None
         self.agent_run_btn.setEnabled(True); self.agent_cancel_btn.setEnabled(False)
         status = state.get("status", "failed")
-        self.agent_status_label.setText(f"Agent: {status}")
+        verified = state.get("verified", True)
+        if status == "completed" and not verified:
+            self.agent_status_label.setText("Agent: completed (some steps unverified)")
+        else:
+            self.agent_status_label.setText(f"Agent: {status}")
         if state.get("final_answer"):
             self._append_message("assistant", state["final_answer"])
             self._persist_message("assistant", state["final_answer"])
+        if status == "completed" and not verified:
+            self._append_message(
+                "system",
+                "This task finished, but at least one step was denied, invalid, or "
+                "failed. Check the steps above before trusting the result.",
+            )
         if status == "failed" and state.get("error"):
             self._append_message("error", f"Agent error: {state['error']}")
         self._render_chat(force_scroll=True)
@@ -1814,10 +1850,19 @@ class UI(QMainWindow):
                 QMessageBox.warning(self,"Not saved","That looks like sensitive information, so it was not saved.")
                 return
             db.add_memory(text); self.refresh_mem()
+    def _selected_memory(self):
+        item=self.mem_list.currentItem()
+        if item is None:
+            return None
+        memory_id=item.data(Qt.UserRole)
+        return next(
+            (memory for memory in db.memories() if memory["id"]==memory_id),
+            None,
+        )
     def edit_mem(self):
-        row=self.mem_list.currentRow()
-        if row<0: return
-        m=db.memories()[row]
+        m=self._selected_memory()
+        if m is None:
+            return
         text,ok=QInputDialog.getText(self,"Edit memory","Memory:",text=m["text"])
         if ok and text:
             if db.memory_is_sensitive(text):
@@ -1825,57 +1870,263 @@ class UI(QMainWindow):
                 return
             db.update_memory(m["id"],text); self.refresh_mem()
     def del_mem(self):
-        row=self.mem_list.currentRow()
-        if row<0: return
-        m=db.memories()[row]; db.delete_memory(m["id"]); self.refresh_mem()
-    def closeEvent(self,e):
-        cfg=load()
-        cfg["privacy"]["store_conversations"]=self.cb_store.isChecked()
-        cfg["privacy"]["auto_memory"]=self.cb_auto_memory.isChecked()
-        cfg["privacy"]["memory_enabled"]=self.cb_memory_enabled.isChecked()
-        cfg["permissions"]["allow_open_app"]=self.cb_apps.isChecked()
-        cfg["permissions"]["allow_open_url"]=self.cb_web.isChecked()
-        cfg["permissions"]["allow_web_research"]=self.cb_research.isChecked()
-        cfg["permissions"]["allow_screen_capture"]=self.cb_screen.isChecked()
-        cfg["permissions"]["allow_active_window"]=self.cb_active_window.isChecked()
-        cfg["permissions"]["allow_media_control"]=self.cb_media.isChecked()
-        cfg["permissions"]["allow_browser_automation"]=self.cb_browser.isChecked()
-        cfg["permissions"]["allow_run_command"] = False
-        cfg["permissions"]["allow_write_file"]=self.cb_write.isChecked()
-        cfg["permissions"]["allow_vision"]=self.cb_vision.isChecked()
-        cfg["permissions"]["allow_image_generation"]=self.cb_imagegen.isChecked()
-        cfg["ollama"]["vision_model"]=(
+        m=self._selected_memory()
+        if m is None:
+            return
+        db.delete_memory(m["id"]); self.refresh_mem()
+    def check_memory_conflicts(self):
+        try:
+            conflicts=MemoryManager().conflicts()
+        except Exception as exc:
+            log.warning("Memory conflict check failed: %s", exc)
+            self._status(f"Could not check memories: {exc}")
+            return
+        if not conflicts:
+            QMessageBox.information(
+                self,"Memory check",
+                "No likely contradictions were found in your saved memories.",
+            )
+            return
+        lines=[
+            f"• {item['first'][:140]}\n  ↔ {item['second'][:140]}"
+            for item in conflicts[:8]
+        ]
+        QMessageBox.warning(
+            self,"Possible memory contradictions",
+            "These saved memories may disagree:\n\n"
+            + "\n\n".join(lines)
+            + "\n\nReview the Memory list and edit or delete the outdated entry. "
+              "Nothing was changed automatically.",
+        )
+    # ---- settings persistence ----------------------------------------
+    def _connect_settings_autosave(self):
+        for box in (
+            self.cb_store,self.cb_auto_memory,self.cb_memory_enabled,
+            self.cb_apps,self.cb_web,self.cb_research,
+            self.cb_screen,self.cb_screen_control,
+            self.cb_active_window,self.cb_media,self.cb_browser,
+            self.cb_write,self.cb_vision,
+            self.cb_preload,self.cb_deep_reasoning,
+            self.cb_always_on_top,self.cb_minimize_to_tray,
+        ):
+            box.toggled.connect(self._schedule_settings_save)
+        for box in (
+            self.mic_box,self.out_box,self.lang_box,self.voice_box,
+            self.chat_engine_box,self.screen_area,
+        ):
+            box.currentIndexChanged.connect(self._schedule_settings_save)
+        for widget in (self.vol,self.sensitivity,self.reply_wait):
+            widget.valueChanged.connect(self._schedule_settings_save)
+        for listing in (self.allowed_folders,self.development_workspaces):
+            listing.model().rowsInserted.connect(self._schedule_settings_save)
+            listing.model().rowsRemoved.connect(self._schedule_settings_save)
+        for field in (self.embedding_model,self.wake_word_field,self.ollama_host):
+            field.editingFinished.connect(self._save_text_settings)
+        for combo in (self.model_box,self.vision_model_box):
+            combo.currentTextChanged.connect(self._save_text_settings)
+        for button in (self.hotkey,self.screen_hotkey):
+            button.captureStarted.connect(self._suspend_hotkeys)
+            button.captureFinished.connect(self._resume_hotkeys)
+            button.chordChanged.connect(self._apply_hotkey_change)
+    def _schedule_settings_save(self,*_args):
+        self._settings_save_timer.start()
+    def _autosave_settings(self):
+        self._save_settings(interactive=False)
+    def _save_text_settings(self,*_args):
+        self._save_settings(interactive=False, include_text=True)
+    def _settings_updates(self,*,text_fields=True):
+        updates = {
+            "privacy": {
+                "store_conversations": self.cb_store.isChecked(),
+                "auto_memory": self.cb_auto_memory.isChecked(),
+                "memory_enabled": self.cb_memory_enabled.isChecked(),
+            },
+            "permissions": {
+                "allow_open_app": self.cb_apps.isChecked(),
+                "allow_open_url": self.cb_web.isChecked(),
+                "allow_web_research": self.cb_research.isChecked(),
+                "allow_screen_capture": self.cb_screen.isChecked(),
+                "allow_screen_control": self.cb_screen_control.isChecked(),
+                "allow_active_window": self.cb_active_window.isChecked(),
+                "allow_media_control": self.cb_media.isChecked(),
+                "allow_browser_automation": self.cb_browser.isChecked(),
+                "allow_run_command": False,
+                "allow_write_file": self.cb_write.isChecked(),
+                "allow_vision": self.cb_vision.isChecked(),
+                "allowed_folders": [
+                    self.allowed_folders.item(i).text()
+                    for i in range(self.allowed_folders.count())
+                ],
+            },
+            "development": {
+                "workspaces": [
+                    self.development_workspaces.item(i).text()
+                    for i in range(self.development_workspaces.count())
+                ],
+            },
+            "ollama": {
+                "stream_timeout_seconds": self.reply_wait.value(),
+                "preload_model": self.cb_preload.isChecked(),
+                "deep_reasoning": self.cb_deep_reasoning.isChecked(),
+            },
+            "ui": {
+                "chat_engine": self.chat_engine_box.currentData() or "web",
+                "always_on_top": self.cb_always_on_top.isChecked(),
+                "minimize_to_tray": self.cb_minimize_to_tray.isChecked(),
+            },
+            "voice": {
+                "volume": self.vol.value()/100,
+                "speak_replies": bool(self.voice_btn.isChecked()),
+                "microphone_device": self.mic_box.currentData(),
+                "output_device": self.out_box.currentData(),
+                "wake_word_enabled": self.cb_wake.isChecked(),
+                "sensitivity": max(0.1, min(1.0, self.sensitivity.value()/100)),
+                "recognition_language": self._recognition_language(),
+                "language": self._recognition_language(),
+            },
+            "screen": {
+                "monitor": str(self.screen_area.currentData() or "primary"),
+                "region": getattr(self, "_screen_region", None),
+            },
+        }
+        if self.voice_box.count():
+            updates["voice"]["tts_voice"] = self.voice_box.currentText()
+        if not text_fields:
+            return updates
+        updates["ollama"]["vision_model"] = (
             self.vision_model_box.currentText().strip() or "qwen2.5vl:3b"
         )
-        imagegen_host = self.imagegen_host.text().strip()
-        cfg.setdefault("imagegen", {})
-        if imagegen_host.startswith(("http://", "https://")):
-            cfg["imagegen"]["base_url"] = imagegen_host
-        cfg["ui"]["chat_engine"] = self.chat_engine_box.currentData() or "web"
-        cfg["ui"]["always_on_top"]=self.cb_always_on_top.isChecked()
-        cfg["ui"]["minimize_to_tray"]=self.cb_minimize_to_tray.isChecked()
-        cfg["permissions"]["allowed_folders"]=[
-            self.allowed_folders.item(i).text() for i in range(self.allowed_folders.count())
-        ]
-        cfg["ollama"]["chat_model"]=self.model_box.currentText()
-        cfg["ollama"]["stream_timeout_seconds"]=self.reply_wait.value()
-        cfg["ollama"]["preload_model"]=self.cb_preload.isChecked()
-        cfg["ollama"]["deep_reasoning"]=self.cb_deep_reasoning.isChecked()
+        updates["memory"] = {
+            "embedding_model": self.embedding_model.text().strip(),
+        }
+        updates["voice"]["push_to_talk_key"] = _chord_value(self.hotkey, "f9")
+        updates["voice"]["wake_word"] = self.wake_word_field.text().strip() or "Himari"
+        updates["screen"]["capture_hotkey"] = _chord_value(
+            self.screen_hotkey, "f10"
+        )
         host = self.ollama_host.text().strip()
         if host.startswith(("http://", "https://")):
-            cfg["ollama"]["host"] = host
-        cfg["voice"]["volume"]=self.vol.value()/100
-        cfg["voice"]["speak_replies"]=bool(self.voice_btn.isChecked())
-        cfg["voice"]["tts_voice"]=self.voice_box.currentText() if self.voice_box.count() else cfg["voice"].get("tts_voice", "en_US-amy-medium")
-        cfg["voice"]["push_to_talk_key"]=self.hotkey.text().strip() or "f9"
-        cfg["voice"]["microphone_device"]=self.mic_box.currentData()
-        cfg["voice"]["wake_word_enabled"]=self.cb_wake.isChecked()
-        cfg["voice"]["wake_word"]=self.wake_word_field.text().strip() or "Himari"
-        cfg["voice"]["sensitivity"]=max(0.1, min(1.0, self.sensitivity.value()/100))
-        cfg["voice"]["recognition_language"] = self._recognition_language()
-        cfg["voice"]["language"] = cfg["voice"]["recognition_language"]
-        cfg.setdefault("screen", {})["capture_hotkey"] = self.screen_hotkey.text().strip() or "f10"
-        save(cfg)
+            updates["ollama"]["host"] = host
+        model = self.model_box.currentText().strip()
+        if model:
+            updates["ollama"]["chat_model"] = model
+        return updates
+    def _save_settings(self,*,interactive=False,include_text=None):
+        if include_text is None:
+            include_text = bool(interactive)
+        try:
+            control_settings.SettingsService().update(
+                self._settings_updates(text_fields=include_text)
+            )
+        except control_settings.SettingsError as exc:
+            log.warning("Settings were not saved: %s", exc)
+            if interactive:
+                QMessageBox.warning(
+                    self, "Settings not saved",
+                    f"Himari kept the previous settings because a value was invalid:\n{exc}",
+                )
+            elif not getattr(self, "_settings_save_warned", False):
+                self._settings_save_warned = True
+                self._status("A setting change could not be saved automatically.")
+            return False
+        self._settings_save_warned = False
+        return True
+    def _suspend_hotkeys(self):
+        self._remove_hotkeys()
+    def _resume_hotkeys(self):
+        self._bind_hotkeys()
+    def _apply_hotkey_change(self,*_args):
+        ptt = _chord_value(self.hotkey, "f9")
+        capture = _chord_value(self.screen_hotkey, "f10")
+        if ptt != self.hotkey.currentChord():
+            self.hotkey.setChord(ptt, emit=False)
+        if capture != self.screen_hotkey.currentChord():
+            self.screen_hotkey.setChord(capture, emit=False)
+        if ptt.casefold() == capture.casefold():
+            self._status("Push-to-talk and screen capture need different shortcuts.")
+            self._bind_hotkeys()
+            return
+        try:
+            control_settings.SettingsService().update({
+                "voice": {"push_to_talk_key": ptt},
+                "screen": {"capture_hotkey": capture},
+            })
+        except control_settings.SettingsError as exc:
+            log.warning("Shortcuts were not saved: %s", exc)
+            self._status(f"Shortcut not saved: {exc}")
+            self._bind_hotkeys()
+            return
+        self._bind_hotkeys()
+        self._update_shortcut_hint(ptt, capture)
+        problems = [
+            message for message in (self.hotkey_error, self.screen_hotkey_error)
+            if message
+        ]
+        if problems:
+            self._status(" ".join(problems))
+        else:
+            self._status(
+                f"Shortcuts saved — {ptt.upper()} to talk, "
+                f"{capture.upper()} to capture."
+            )
+    def _select_screen_region(self):
+        if not self.cb_screen.isChecked():
+            self._status("Enable screen capture before choosing a region.")
+            return
+        from .region_select import select_region
+
+        region, error = select_region(None, self.theme_name)
+        if error:
+            self._status(error)
+            return
+        if region is None:
+            self._status("Region selection cancelled.")
+            return
+        previous_region = self._screen_region
+        previous_index = self.screen_area.currentIndex()
+        self._screen_region = region
+        region_index = self.screen_area.findData("region")
+        if region_index >= 0:
+            blocked = self.screen_area.blockSignals(True)
+            self.screen_area.setCurrentIndex(region_index)
+            self.screen_area.blockSignals(blocked)
+        self._refresh_region_label()
+        if not self._save_settings(interactive=False):
+            self._screen_region = previous_region
+            blocked = self.screen_area.blockSignals(True)
+            self.screen_area.setCurrentIndex(previous_index)
+            self.screen_area.blockSignals(blocked)
+            self._refresh_region_label()
+            return
+        self._status(
+            "Custom capture region saved — press the screen key to try it."
+        )
+    def _clear_screen_region(self):
+        previous_region = self._screen_region
+        previous_index = self.screen_area.currentIndex()
+        self._screen_region = None
+        if self.screen_area.currentData() == "region":
+            primary_index = self.screen_area.findData("primary")
+            blocked = self.screen_area.blockSignals(True)
+            self.screen_area.setCurrentIndex(max(0, primary_index))
+            self.screen_area.blockSignals(blocked)
+        self._refresh_region_label()
+        if not self._save_settings(interactive=False):
+            self._screen_region = previous_region
+            blocked = self.screen_area.blockSignals(True)
+            self.screen_area.setCurrentIndex(previous_index)
+            self.screen_area.blockSignals(blocked)
+            self._refresh_region_label()
+            return
+        self._status("Custom region cleared — captures use the whole screen again.")
+    def showEvent(self,event):
+        super().showEvent(event)
+        first_time = not getattr(self, "_window_shown_once", False)
+        self._window_shown_once = True
+        ui_effects.fade_window(self, first_time=first_time)
+    def closeEvent(self,e):
+        self._release_confirmations()
+        self._save_settings(interactive=True)
         self._cancel_event.set()
         self.tts.stop()
         if self.mic.rec: self.mic.stop()
@@ -1899,4 +2150,17 @@ def run():
     from .logging_setup import configure_logging
 
     configure_logging()
-    app=QApplication(sys.argv); w=UI(); w.show(); sys.exit(app.exec())
+    app=QApplication(sys.argv)
+    from .crash import install as install_crash_handlers
+
+    install_crash_handlers(app)
+    from .single_instance import SingleInstance
+
+    guard=SingleInstance(app)
+    if not guard.acquire():
+        log.info("Himari is already running; asked the existing window to show.")
+        return
+    w=UI()
+    guard.activated.connect(lambda:(w.show(),w.raise_(),w.activateWindow()))
+    w.show()
+    sys.exit(app.exec())

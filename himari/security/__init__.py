@@ -5,17 +5,30 @@ fail-closed: unknown tools are denied, high-risk tools require explicit user
 confirmation, and every decision is audited with secrets redacted.
 """
 
+import logging
+
 from .audit import audit, redact_value
-from .confirmation import ConfirmationRequest, require_confirmation
+from .confirmation import (
+    ConfirmationRequest,
+    new_decision,
+    release_pending_confirmations,
+    require_confirmation,
+    resolve_decision,
+    wait_for_decision,
+)
 from .permissions import Decision, PermissionManager, RiskLevel, SecurityContext
 from .policies import risk_for, tool_is_known
 from .validation import ValidationError, validate_command, validate_path, validate_text
+from ..tool_results import classify_result
+
+log = logging.getLogger("himari.security")
 
 
 class SecurityLayer:
-    def __init__(self, confirm_callback=None, manager=None):
+    def __init__(self, confirm_callback=None, manager=None, on_confirmation=None):
         self.permissions = manager or PermissionManager()
         self.confirm_callback = confirm_callback
+        self.on_confirmation = on_confirmation
 
     def authorize(self, tool, arguments=None):
         decision = self.permissions.authorize(tool, arguments)
@@ -23,6 +36,11 @@ class SecurityLayer:
             audit(tool, decision.risk, arguments, decision)
             return decision
         if decision.requires_confirmation:
+            if self.on_confirmation:
+                try:
+                    self.on_confirmation(tool, decision.risk, decision.reason)
+                except Exception as exc:
+                    log.warning("Confirmation notification failed: %s", exc)
             request = ConfirmationRequest(
                 tool=tool,
                 risk=decision.risk,
@@ -48,7 +66,15 @@ class SecurityLayer:
 
     def record_result(self, tool, arguments, result):
         decision = Decision(True, risk_for(tool), "Executed.")
-        audit(tool, decision.risk, arguments, decision, result=result)
+        succeeded, error = classify_result(result)
+        audit(
+            tool,
+            decision.risk,
+            arguments,
+            decision,
+            result=result,
+            outcome={"ok": succeeded, "error": error},
+        )
 
     def wrap_tools(self, tools):
         """Return TOOLS-compatible entries whose handlers pass through security."""
@@ -88,4 +114,8 @@ __all__ = [
     "validate_command",
     "validate_path",
     "validate_text",
+    "new_decision",
+    "resolve_decision",
+    "release_pending_confirmations",
+    "wait_for_decision",
 ]

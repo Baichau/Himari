@@ -41,6 +41,29 @@ def _one_of(options):
     return check
 
 
+def _screen_area(value):
+    if not isinstance(value, str) or not value.strip():
+        return False
+    area = value.strip().casefold()
+    return area in ("primary", "all", "active", "region") or area.isdigit()
+
+
+def _region(value):
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    keys = ("left", "top", "width", "height")
+    if set(value) != set(keys):
+        return False
+    if not all(
+        isinstance(value[key], int) and not isinstance(value[key], bool)
+        for key in keys
+    ):
+        return False
+    return value["width"] > 0 and value["height"] > 0
+
+
 SCHEMA = {
     "ollama": {
         "host": lambda value: _is_text(value) and value.startswith(("http://", "https://")),
@@ -66,23 +89,21 @@ SCHEMA = {
         "wake_word": _is_text,
         "microphone_device": lambda value: value is None
         or (isinstance(value, int) and not isinstance(value, bool) and value >= 0),
+        "output_device": lambda value: value is None
+        or (isinstance(value, int) and not isinstance(value, bool) and value >= 0),
         "sensitivity": _number(0.1, 1),
     },
     "screen": {
-        "monitor": _is_text,
+        "monitor": _screen_area,
         "capture_hotkey": _is_text,
+        "region": _region,
     },
-    "imagegen": {
-        "base_url": lambda value: _is_text(value) and value.startswith(("http://", "https://")),
-        "auto_start": _is_bool,
-        "free_ollama_vram": _is_bool,
-        "timeout_seconds": _number(30, 1800),
-        "steps": _number(4, 60),
-        "width": _number(256, 1024),
-        "height": _number(256, 1024),
-        "cfg_scale": _number(1, 20),
-        "sampler": _is_text,
-        "negative_prompt": lambda value: isinstance(value, str),
+    "research": {
+        "searx_url": lambda value: isinstance(value, str)
+        and (not value.strip() or value.strip().startswith(("http://", "https://"))),
+    },
+    "memory": {
+        "embedding_model": lambda value: isinstance(value, str),
     },
     "privacy": {
         "store_conversations": _is_bool,
@@ -94,10 +115,10 @@ SCHEMA = {
         "allow_open_url": _is_bool,
         "allow_web_research": _is_bool,
         "allow_vision": _is_bool,
-        "allow_image_generation": _is_bool,
         "allow_volume": _is_bool,
         "allow_read_file": _is_bool,
         "allow_screen_capture": _is_bool,
+        "allow_screen_control": _is_bool,
         "allow_active_window": _is_bool,
         "allow_media_control": _is_bool,
         "allow_run_command": _is_bool,

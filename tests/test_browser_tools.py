@@ -25,6 +25,7 @@ def test_new_browser_tools_are_registered():
         "browser_tabs",
         "browser_read",
         "browser_close",
+        "find_video",
     } <= names
     for name in names & {
         "open_first_result",
@@ -34,6 +35,7 @@ def test_new_browser_tools_are_registered():
         "browser_tabs",
         "browser_read",
         "browser_close",
+        "find_video",
     }:
         assert name in policies.TOOL_RISKS
         assert name in policies.TOOL_PERMISSIONS
@@ -72,7 +74,9 @@ def test_browser_open_rejects_invalid_urls(monkeypatch):
     assert tools.browser_open("  ").startswith("Provide a website URL")
 
 
-def test_browser_open_reports_permission_denial():
+def test_browser_open_reports_permission_denial(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: False)
+
     assert "disabled in Settings" in tools.browser_open("https://example.com")
 
 
@@ -128,9 +132,32 @@ def test_browser_open_result_opens_requested_number(monkeypatch):
 
     result = tools.browser_open_result("christmas images", 2)
 
-    assert seen == {"url": "https://images.example/free", "new_tab": True}
+    assert seen == {"url": "https://images.example/free", "new_tab": False}
     assert "result 2 of 2" in result
     assert "Free Christmas images" in result
+    assert "current tab" in result
+    assert "replaced" in result
+
+
+def test_browser_open_result_opens_a_new_tab_only_when_asked(monkeypatch):
+    _allow(monkeypatch)
+    monkeypatch.setattr(tools, "_fetch_web_results", lambda query: (RESULTS, None))
+    seen = {}
+
+    def fake_run(func, url, new_tab):
+        seen["new_tab"] = new_tab
+        return {
+            "ok": True, "index": 3, "total": 3,
+            "title": "Free Christmas images", "url": "https://images.example/free",
+        }
+
+    monkeypatch.setattr(tools, "_run_browser", fake_run)
+
+    result = tools.browser_open_result("christmas images", 2, new_tab=True)
+
+    assert seen["new_tab"] is True
+    assert "new tab" in result
+    assert "replaced" not in result
 
 
 def test_browser_open_result_validates_the_number(monkeypatch):

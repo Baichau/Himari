@@ -21,6 +21,8 @@ class Memory:
     source: str
     created: float
     approved: bool
+    score: float = 0.0
+    reason: str = ""
 
     @classmethod
     def from_row(cls, row):
@@ -34,4 +36,6 @@ class Memory:
             source=row["source"],
             created=row["created"],
             approved=bool(row["approved"]),
+            score=float(row["score"]) if "score" in keys and row["score"] is not None else 0.0,
+            reason=str(row["reason"]) if "reason" in keys and row["reason"] else "",
         )

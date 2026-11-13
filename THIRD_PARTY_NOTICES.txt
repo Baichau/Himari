@@ -80,27 +80,6 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 
-Bundled Stable Diffusion image engine
-=====================================
-
-The portable release embeds `sd-server` from stable-diffusion.cpp (commit
-465adf3) together with its ggml Vulkan libraries. stable-diffusion.cpp and
-ggml are distributed under the MIT License; the license texts travel with the
-embedded server files as `stable-diffusion.cpp.txt` and `ggml.txt`.
-https://github.com/leejet/stable-diffusion.cpp
-https://github.com/ggml-org/ggml
-
-The bundled checkpoint is Stable Diffusion v1.5 quantized to GGUF Q8_0
-(gpustack/stable-diffusion-v1-5-GGUF). Stable Diffusion v1.5 is distributed
-under the CreativeML OpenRAIL-M license, which permits use and redistribution
-with use-based restrictions:
-https://huggingface.co/runwayml/stable-diffusion-v1-5
-https://huggingface.co/spaces/CompVis/stable-diffusion-license
-
-The checkpoint is generated locally on the user's machine; Himari does not
-download model weights.
-
-
 Bundled English Piper voice
 ===========================
 

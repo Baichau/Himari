@@ -17,8 +17,11 @@ class AgentCancelledError(AgentError):
 
 class AgentStatus(str, Enum):
     IDLE = "idle"
+    UNDERSTANDING = "understanding"
     PLANNING = "planning"
+    WAITING_FOR_PERMISSION = "waiting_for_permission"
     EXECUTING = "executing"
+    OBSERVING = "observing"
     VERIFYING = "verifying"
     COMPLETED = "completed"
     FAILED = "failed"

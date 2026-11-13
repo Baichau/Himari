@@ -119,17 +119,13 @@ def _vision_check(model_status, config):
     return check
 
 
-def _image_server_check(config, probe=None):
+def _screen_control_check():
     def check():
-        from .. import imagegen
-
-        base_url = str(
-            config.get("imagegen", {}).get("base_url")
-            or imagegen.DEFAULT_BASE_URL
-        )
-        runner = probe or imagegen.probe
-        ready, message = runner(base_url)
-        return ready, message
+        try:
+            import pywinauto  # noqa: F401
+        except Exception as exc:
+            return False, f"pywinauto is not available: {exc}"
+        return True, "Windows UI Automation is available for screen control."
     return check
 
 
@@ -165,8 +161,6 @@ def run_diagnostics(
     model_status=None,
     include_windows=False,
     include_ollama=True,
-    image_probe=None,
-    include_image_server=True,
 ):
     config = load() if config is None else config
     checks = [
@@ -181,12 +175,9 @@ def run_diagnostics(
     if include_ollama:
         checks.append(_check("Ollama", _ollama_check(model_status, config)))
         checks.append(_check("Vision", _vision_check(model_status, config)))
-    if include_image_server and isinstance(config.get("imagegen"), dict):
-        checks.append(
-            _check("Image generation", _image_server_check(config, image_probe))
-        )
     if include_windows:
         checks.append(_check("Windows discovery", _windows_check()))
+        checks.append(_check("Screen control", _screen_control_check()))
     checks.append(_check("Platform", lambda: (platform.system() == "Windows", platform.platform())))
     return checks
 

@@ -4,7 +4,7 @@ from .extraction import extract_candidate
 from .manager import MemoryManager, normalize
 from .models import CATEGORIES, Memory
 from .retrieval import retrieve
-from .summarizer import summarize_session
+from .summarizer import summarize_older, summarize_session
 
 __all__ = [
     "CATEGORIES",
@@ -13,5 +13,6 @@ __all__ = [
     "normalize",
     "extract_candidate",
     "retrieve",
+    "summarize_older",
     "summarize_session",
 ]

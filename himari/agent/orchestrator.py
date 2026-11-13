@@ -44,6 +44,19 @@ class AgentOrchestrator:
         self.max_rounds = max_rounds
         self.on_status = on_status
 
+        previous_hook = getattr(self.security, "on_confirmation", None)
+
+        def permission_notice(tool, risk, reason):
+            if self._active_state is not None:
+                self._active_state.status = AgentStatus.WAITING_FOR_PERMISSION
+                self._emit(self._active_state, f"Waiting for your permission to use {tool}.")
+            if previous_hook:
+                previous_hook(tool, risk, reason)
+
+        self.security.on_confirmation = permission_notice
+
+    _active_state = None
+
     def run(self, task, token=None):
         token = token or CancellationToken()
         state = AgentState(task=str(task), max_rounds=self.max_rounds)
@@ -52,6 +65,8 @@ class AgentOrchestrator:
             {"role": "user", "content": state.task},
         ]
         blocked = set()
+        self._active_state = state
+        state.status = AgentStatus.UNDERSTANDING
         self._emit(state, "Understanding the request.")
 
         try:
@@ -81,7 +96,8 @@ class AgentOrchestrator:
                     blocked.add(name)
 
                 self._remember(messages, name, step, plan.get("ignored_calls", 0))
-                self._emit(state, self._step_detail(step))
+                state.status = AgentStatus.OBSERVING
+                self._emit(state, self._observation_detail(step))
             else:
                 state.finish(
                     AgentStatus.FAILED,
@@ -92,6 +108,8 @@ class AgentOrchestrator:
         except Exception as exc:
             log.warning("Agent task failed: %s", exc)
             state.finish(AgentStatus.FAILED, f"Task failed: {exc}")
+        finally:
+            self._active_state = None
 
         self._emit(state, self._final_detail(state))
         return state
@@ -111,9 +129,11 @@ class AgentOrchestrator:
                 ),
             )
 
-        state.status = AgentStatus.EXECUTING
-        self._emit(state, f"Running {name}.")
-        result = self.executor.execute(name, arguments, token=token)
+        def started(_tool):
+            state.status = AgentStatus.EXECUTING
+            self._emit(state, f"Running {name}.")
+
+        result = self.executor.execute(name, arguments, token=token, on_start=started)
         return AgentStep(
             index=len(state.steps) + 1,
             tool=str(name),
@@ -163,14 +183,23 @@ class AgentOrchestrator:
         })
 
     @staticmethod
-    def _step_detail(step):
+    def _observation_detail(step):
         label = step.status.value.capitalize()
-        return f"{label}: {step.tool}" + (f" ({step.error})" if step.error else "")
+        detail = f"Observed {step.tool}: {label}"
+        return detail + (f" ({step.error})" if step.error else "")
 
     @staticmethod
     def _final_detail(state):
         if state.status is AgentStatus.COMPLETED:
-            return "Task completed."
+            if state.verified:
+                return "Task completed and every executed step succeeded."
+            unverified = sum(
+                1 for step in state.steps if step.status is not StepStatus.SUCCEEDED
+            )
+            return (
+                f"Task completed, but {unverified} of {len(state.steps)} step(s) "
+                "did not succeed, so the outcome is not fully verified."
+            )
         if state.status is AgentStatus.CANCELLED:
             return "Task cancelled."
         return f"Task failed: {state.error}"
@@ -183,6 +212,7 @@ class AgentOrchestrator:
             "status": state.status.value,
             "round": state.rounds,
             "detail": detail,
+            "verified": state.verified,
             "steps": [step.to_dict() for step in state.steps],
         }
         try:

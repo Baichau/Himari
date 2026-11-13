@@ -275,6 +275,53 @@ def test_stream_chat_recovers_from_an_empty_reply_with_a_shorter_context():
     assert any("empty reply" in status.lower() for status in statuses)
 
 
+def test_empty_reply_retry_keeps_tool_observations():
+    action = Mock(return_value="Chrome is installed.")
+    client = Mock()
+    client.chat.side_effect = [
+        iter([_chunk(tool_calls=[_tool_call("find_app", {"name": "chrome"})])]),
+        iter([_chunk("")]),
+        iter([_chunk("Yes, Chrome is installed.")]),
+    ]
+    llm = LLM([{"name": "find_app", "fn": action, "spec": {}}])
+    messages = [
+        {"role": "system", "content": "System rules."},
+        {"role": "user", "content": "Older question"},
+        {"role": "assistant", "content": "Older answer"},
+        {"role": "user", "content": "Is Chrome installed?"},
+    ]
+
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.time.sleep"), \
+         patch("himari.llm.db.log_action"):
+        result = llm.stream_chat(messages)
+
+    assert result == "Yes, Chrome is installed."
+    retry_messages = client.chat.call_args_list[2].kwargs["messages"]
+    assert retry_messages[0] == {"role": "system", "content": "System rules."}
+    assert retry_messages[1] == {"role": "user", "content": "Is Chrome installed?"}
+    assert any(
+        message["role"] == "tool" and message["content"] == "Chrome is installed."
+        for message in retry_messages
+    )
+    assert all("Older" not in str(message.get("content")) for message in retry_messages)
+
+
+def test_empty_reply_retry_caps_long_tool_observations():
+    from himari.llm import _RETRY_TOOL_CHARS, _short_retry_messages
+
+    retry = _short_retry_messages([
+        {"role": "system", "content": "System rules."},
+        {"role": "user", "content": "Read the file."},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "1"}]},
+        {"role": "tool", "content": "x" * (_RETRY_TOOL_CHARS + 500), "tool_name": "read"},
+    ])
+
+    tool_message = next(message for message in retry if message["role"] == "tool")
+    assert len(tool_message["content"]) == _RETRY_TOOL_CHARS + 2
+    assert tool_message["content"].endswith(" …")
+
+
 def test_stream_chat_raises_a_clear_error_when_empty_replies_continue():
     client = Mock()
     client.chat.side_effect = [
@@ -359,3 +406,187 @@ def test_stream_chat_keeps_partial_content_when_cancelled_mid_stream():
 
     assert error.value.partial == "Hel"
     assert tokens == ["Hel"]
+
+
+def _config_with_context(value):
+    import copy
+
+    from himari.config import DEFAULT
+
+    config = copy.deepcopy(DEFAULT)
+    config["ollama"]["context_window"] = value
+    return config
+
+
+def test_stream_chat_sends_the_configured_context_window(monkeypatch):
+    client = Mock()
+    client.chat.return_value = iter([_chunk("Hello.")])
+    monkeypatch.setattr("himari.llm.load", lambda: _config_with_context(8192))
+    llm = LLM()
+    with patch.object(llm, "client", return_value=client):
+        assert llm.stream_chat([]) == "Hello."
+    assert client.chat.call_args.kwargs["options"]["num_ctx"] == 8192
+
+
+def test_preload_uses_the_same_context_window(monkeypatch):
+    client = Mock()
+    client.chat.return_value = _chunk("Hi")
+    monkeypatch.setattr("himari.llm.load", lambda: _config_with_context(8192))
+    llm = LLM()
+    with patch.object(llm, "client", return_value=client):
+        llm.preload()
+    assert client.chat.call_args.kwargs["options"]["num_ctx"] == 8192
+
+
+def test_context_window_is_clamped_to_safe_bounds(monkeypatch):
+    llm = LLM()
+    for value, expected in ((100, 2048), (999999, 32768), ("not a number", 8192)):
+        monkeypatch.setattr(
+            "himari.llm.load", lambda value=value: _config_with_context(value)
+        )
+        assert llm._context_window() == expected
+
+
+def test_chat_rejects_malformed_tool_arguments_before_the_handler_runs():
+    action = Mock(return_value="should not run")
+    client = Mock()
+    client.chat.side_effect = [
+        iter([_chunk(tool_calls=[_tool_call("open_app", {"wrong": "value"})])]),
+        iter([_chunk("I will correct that.")]),
+    ]
+    spec = {
+        "type": "function",
+        "function": {
+            "name": "open_app",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    }
+    llm = LLM([{"name": "open_app", "fn": action, "spec": spec}])
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.db.log_action"):
+        assert llm.stream_chat([]) == "I will correct that."
+
+    action.assert_not_called()
+    second_messages = client.chat.call_args_list[1].kwargs["messages"]
+    observation = next(m["content"] for m in second_messages if m["role"] == "tool")
+    assert "Invalid arguments" in observation
+    assert "Missing required argument" in observation
+
+
+def test_chat_accepts_valid_tool_arguments():
+    action = Mock(return_value="Opened Chrome.")
+    client = Mock()
+    client.chat.side_effect = [
+        iter([_chunk(tool_calls=[_tool_call("open_app", {"name": "Chrome"})])]),
+        iter([_chunk("Chrome is open.")]),
+    ]
+    spec = {
+        "type": "function",
+        "function": {
+            "name": "open_app",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    }
+    llm = LLM([{"name": "open_app", "fn": action, "spec": spec}])
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.db.log_action"):
+        assert llm.stream_chat([]) == "Chrome is open."
+
+    action.assert_called_once_with(name="Chrome")
+
+
+def test_chat_reports_a_timed_out_tool_without_hanging():
+    import time
+
+    action = Mock(side_effect=lambda **kwargs: time.sleep(0.3) or "late")
+    client = Mock()
+    client.chat.side_effect = [
+        iter([_chunk(tool_calls=[_tool_call("slow_tool", {})])]),
+        iter([_chunk("That took too long.")]),
+    ]
+    spec = {
+        "type": "function",
+        "function": {"name": "slow_tool", "parameters": {"type": "object", "properties": {}}},
+    }
+    llm = LLM([
+        {"name": "slow_tool", "fn": action, "spec": spec, "timeout_seconds": 0.05}
+    ])
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.db.log_action"):
+        assert llm.stream_chat([]) == "That took too long."
+
+    observation = next(
+        message["content"]
+        for message in client.chat.call_args_list[1].kwargs["messages"]
+        if message["role"] == "tool"
+    )
+    assert observation.startswith("Timed out:")
+    assert "may still be running" in observation
+
+
+def test_tool_timeout_helper_uses_per_tool_metadata():
+    from himari.tool_exec import DEFAULT_TOOL_TIMEOUT_SECONDS, timeout_for
+
+    assert timeout_for({}) == DEFAULT_TOOL_TIMEOUT_SECONDS
+    assert timeout_for({"timeout_seconds": 5}) == 5.0
+    assert timeout_for({"timeout_seconds": "bad"}) == DEFAULT_TOOL_TIMEOUT_SECONDS
+
+
+def test_failed_tool_outcomes_are_logged_with_the_shared_classifier(caplog):
+    from himari.llm import _log_tool_outcome
+
+    with caplog.at_level("INFO", logger="himari.llm"):
+        _log_tool_outcome("open_app", "Denied: not allowed")
+        _log_tool_outcome("find_app", "Chrome is installed.")
+
+    assert "open_app" in caplog.text
+    assert "Denied: not allowed" in caplog.text
+    assert "find_app" not in caplog.text
+
+
+def test_think_is_not_sent_to_models_without_thinking_support():
+    client = Mock()
+    client.chat.return_value = iter([_chunk("Direct answer.")])
+    llm = LLM()
+    llm.capabilities = frozenset({"completion"})
+    statuses = []
+    with patch.object(llm, "client", return_value=client):
+        assert llm.stream_chat([], think=True, on_status=statuses.append) == "Direct answer."
+
+    assert client.chat.call_args.kwargs["think"] is False
+    assert any("does not support deep thinking" in status for status in statuses)
+
+
+def test_tools_are_not_advertised_to_models_without_tool_support():
+    action = Mock(return_value="unused")
+    client = Mock()
+    client.chat.return_value = iter([_chunk("Plain answer.")])
+    llm = LLM([{"name": "open_app", "fn": action, "spec": {}}])
+    llm.capabilities = frozenset({"completion"})
+    statuses = []
+    with patch.object(llm, "client", return_value=client):
+        assert llm.stream_chat([], on_status=statuses.append) == "Plain answer."
+
+    assert "tools" not in client.chat.call_args.kwargs
+    assert any("does not support tool calls" in status for status in statuses)
+
+
+def test_unknown_capabilities_keep_the_previous_behaviour():
+    action = Mock(return_value="unused")
+    client = Mock()
+    client.chat.return_value = iter([_chunk("Answer.")])
+    llm = LLM([{"name": "open_app", "fn": action, "spec": {}}])
+
+    with patch.object(llm, "client", return_value=client):
+        assert llm.stream_chat([], think=True) == "Answer."
+
+    assert client.chat.call_args.kwargs["think"] is True
+    assert client.chat.call_args.kwargs["tools"] == [{}]

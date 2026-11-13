@@ -202,6 +202,21 @@ class STT:
         segs,info=self.model.transcribe(audio, **options)
         return " ".join(s.text.strip() for s in segs).strip()
 class WakeWordMonitor:
+    """VAD-gated listener that transcribes one complete phrase per utterance.
+
+    Audio above the energy threshold starts an utterance, a short pre-roll keeps
+    the first syllable, and the utterance is queued only after enough trailing
+    silence (or the maximum length is reached). This avoids running speech
+    recognition on every noisy callback, which used to split words and miss
+    the wake phrase.
+    """
+
+    SAMPLE_RATE = 16000
+    PREROLL_SECONDS = 0.3
+    SILENCE_SECONDS = 0.6
+    MIN_SPEECH_SECONDS = 0.25
+    MAX_UTTERANCE_SECONDS = 8.0
+
     def __init__(self, on_detect=None, on_error=None):
         self.on_detect = on_detect
         self.on_error = on_error
@@ -209,11 +224,20 @@ class WakeWordMonitor:
         self.stream = None
         self.thread = None
         self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
         self._buffer = []
+        self._preroll = []
+        self._queue = []
+        self._silence_samples = 0
+        self._speech_samples = 0
         self._last_trigger = 0.0
         self._wake_word = "Himari"
         self._stt = None
         self._energy_threshold = 0.01
+        self._min_speech_samples = int(self.SAMPLE_RATE * self.MIN_SPEECH_SECONDS)
+        self._silence_limit_samples = int(self.SAMPLE_RATE * self.SILENCE_SECONDS)
+        self._preroll_limit_samples = int(self.SAMPLE_RATE * self.PREROLL_SECONDS)
+        self._max_utterance_samples = int(self.SAMPLE_RATE * self.MAX_UTTERANCE_SECONDS)
 
     def start(self):
         if self.monitoring:
@@ -224,8 +248,14 @@ class WakeWordMonitor:
         self._energy_threshold = max(0.003, (1.0 - sensitivity) * 0.04)
         self._stt = STT()
         self._last_trigger = 0.0
+        with self._lock:
+            self._buffer.clear()
+            self._preroll.clear()
+            self._queue.clear()
+            self._silence_samples = 0
+            self._speech_samples = 0
         stream = sd.InputStream(
-            samplerate=16000,
+            samplerate=self.SAMPLE_RATE,
             channels=1,
             dtype="float32",
             device=cfg.get("microphone_device"),
@@ -250,6 +280,13 @@ class WakeWordMonitor:
             except Exception:
                 pass
             self.stream = None
+        with self._condition:
+            self._buffer.clear()
+            self._preroll.clear()
+            self._queue.clear()
+            self._silence_samples = 0
+            self._speech_samples = 0
+            self._condition.notify_all()
         self.thread = None
 
     def _callback(self, indata, frames, time_info, status):
@@ -261,27 +298,51 @@ class WakeWordMonitor:
         if samples.size == 0:
             return
         rms = float(np.sqrt(np.mean(np.square(samples))))
-        if rms < self._energy_threshold:
-            return
-        with self._lock:
-            self._buffer.append(samples)
-            while len(self._buffer) > 12:
-                self._buffer.pop(0)
+        with self._condition:
+            if rms >= self._energy_threshold:
+                if not self._buffer:
+                    self._buffer.extend(self._preroll)
+                    self._preroll.clear()
+                self._buffer.append(samples)
+                self._silence_samples = 0
+                self._speech_samples += samples.size
+            elif self._buffer:
+                self._buffer.append(samples)
+                self._silence_samples += samples.size
+                if self._silence_samples >= self._silence_limit_samples:
+                    self._finish_utterance_locked()
+            else:
+                self._preroll.append(samples)
+                while sum(chunk.size for chunk in self._preroll) > self._preroll_limit_samples:
+                    self._preroll.pop(0)
+            if (
+                self._buffer
+                and sum(chunk.size for chunk in self._buffer) >= self._max_utterance_samples
+            ):
+                self._finish_utterance_locked()
+
+    def _finish_utterance_locked(self):
+        chunk = np.concatenate(self._buffer)
+        speech_samples = self._speech_samples
+        self._buffer.clear()
+        self._preroll.clear()
+        self._silence_samples = 0
+        self._speech_samples = 0
+        if speech_samples >= self._min_speech_samples:
+            self._queue.append(chunk)
+            self._condition.notify()
 
     def _run(self):
         while self.monitoring:
             try:
-                time.sleep(0.25)
-                with self._lock:
-                    if not self._buffer:
+                with self._condition:
+                    if not self._queue:
+                        self._condition.wait(0.25)
                         continue
-                    chunk = np.concatenate(self._buffer)
-                    self._buffer.clear()
-                if chunk.size < 1600:
-                    continue
+                    chunk = self._queue.pop(0)
                 if self._stt is None:
                     self._stt = STT()
-                text = self._stt.transcribe(chunk, sr=16000)
+                text = self._stt.transcribe(chunk, sr=self.SAMPLE_RATE)
                 if not text:
                     continue
                 if re.search(rf"\b{re.escape(self._wake_word)}\b", text, flags=re.IGNORECASE):
@@ -498,10 +559,19 @@ class TTS:
             else:
                 raise RuntimeError(f"Unsupported Piper WAV sample width: {sw} bytes")
         if ch>1: data=data.reshape(-1,ch).mean(axis=1)
-        vol=max(0.0,min(1.0,float(load()["voice"].get("volume",1.0))))
+        settings=load()["voice"]
+        vol=max(0.0,min(1.0,float(settings.get("volume",1.0))))
+        device=settings.get("output_device")
         with self._play_lock:
             if stop_event.is_set(): return
-            sd.play(data*vol,sr)
+            try:
+                sd.play(data*vol,sr,device=device)
+            except Exception as exc:
+                if device is None:
+                    raise
+                raise RuntimeError(
+                    f"Output device {device} is unavailable. Choose another speaker in Settings. ({exc})"
+                ) from exc
             sd.wait()
     def stop(self):
         self._stop.set()

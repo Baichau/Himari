@@ -1,7 +1,12 @@
 import asyncio
+import ctypes
 import logging
+import os
+from ctypes import wintypes
+
 import mss
 from PIL import Image
+
 log=logging.getLogger("himari.screen")
 
 
@@ -17,6 +22,33 @@ def capture(monitor="primary"):
                 box = screen.monitors[index]
             except (ValueError, IndexError):
                 raise ValueError(f"Unknown screen monitor: {monitor}") from None
+        shot = screen.grab(box)
+        return Image.frombytes("RGB", shot.size, shot.rgb)
+
+
+def active_window_rect():
+    """Return the foreground window's screen rectangle, or raise RuntimeError."""
+    if os.name != "nt":
+        raise RuntimeError("Active-window capture is only available on Windows.")
+    user32 = ctypes.windll.user32
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        raise RuntimeError("Windows did not report an active window.")
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        raise RuntimeError("Windows could not read the active window's bounds.")
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        raise RuntimeError(
+            "The active window is minimized or has no visible area, so it cannot be captured."
+        )
+    return {"left": int(rect.left), "top": int(rect.top), "width": width, "height": height}
+
+
+def capture_active_window():
+    box = active_window_rect()
+    with mss.MSS() as screen:
         shot = screen.grab(box)
         return Image.frombytes("RGB", shot.size, shot.rgb)
 
@@ -56,12 +88,19 @@ def ocr(img):
         img.close()
 
 
-def analyze():
-    image = capture()
+def analyze(monitor="primary", active_window=False):
+    if active_window:
+        image = capture_active_window()
+    elif monitor == "primary":
+        image = capture()
+    else:
+        image = capture(monitor)
     try:
         text = ocr(image)
     finally:
         image.close()
     if not text:
+        if active_window:
+            return "No readable text was detected in the active window."
         return "No readable text was detected on the captured screen."
     return text[:8000]

@@ -226,3 +226,24 @@ def test_sessions_are_grouped_and_titled_from_the_first_user_message(tmp_path):
     finally:
         db.APP_DIR = original_dir
         db.DB = original_db
+
+
+def test_history_stays_within_the_character_budget(tmp_path):
+    original_dir = db.APP_DIR
+    original_db = db.DB
+    try:
+        db.APP_DIR = tmp_path
+        db.DB = tmp_path / "himari.db"
+        for index in range(20):
+            db.add_message("long", "user", f"message {index} " + "x" * 800)
+
+        rows = db.history("long", limit=60, max_chars=3000)
+
+        assert rows
+        assert sum(len(row["content"]) for row in rows) <= 3000 + 801
+        assert rows[-1]["content"].startswith("message 19 ")
+        assert db.message_count("long") == 20
+        assert db.message_count("missing") == 0
+    finally:
+        db.APP_DIR = original_dir
+        db.DB = original_db

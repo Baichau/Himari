@@ -57,7 +57,7 @@ def _ui_elements():
     return elements
 
 
-def build_scene(region=None):
+def build_scene(region=None, monitor=None, active_window=False):
     """Capture once, OCR locally, and return a structured scene.
 
     Raises CapturePermissionError when screen capture is disabled. OCR
@@ -76,8 +76,14 @@ def build_scene(region=None):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        with captured_screen(region) as image:
-            lines = extract_text(image)
+        if monitor is None and not active_window:
+            with captured_screen(region) as image:
+                lines = extract_text(image)
+        else:
+            with captured_screen(
+                region, monitor=monitor, active_window=active_window
+            ) as image:
+                lines = extract_text(image)
     except OcrError as exc:
         scene["ocr_error"] = str(exc)
         return scene

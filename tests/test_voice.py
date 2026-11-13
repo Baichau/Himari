@@ -87,6 +87,53 @@ def test_wake_word_audio_callback_uses_cached_threshold(monkeypatch):
     assert len(monitor._buffer) == 1
 
 
+def test_wake_word_waits_for_a_complete_utterance_before_transcribing():
+    monitor = voice.WakeWordMonitor()
+    monitor.monitoring = True
+    loud = np.full((1600, 1), 0.02, dtype="float32")
+    quiet = np.zeros((1600, 1), dtype="float32")
+
+    for _ in range(4):
+        monitor._callback(loud, 1600, None, None)
+    assert monitor._queue == []
+
+    for _ in range(6):
+        monitor._callback(quiet, 1600, None, None)
+
+    assert len(monitor._queue) == 1
+    assert monitor._queue[0].size >= 4 * 1600
+
+
+def test_wake_word_ignores_a_brief_noise_blip():
+    monitor = voice.WakeWordMonitor()
+    monitor.monitoring = True
+    loud = np.full((1600, 1), 0.02, dtype="float32")
+    quiet = np.zeros((1600, 1), dtype="float32")
+
+    monitor._callback(loud, 1600, None, None)
+    for _ in range(6):
+        monitor._callback(quiet, 1600, None, None)
+
+    assert monitor._queue == []
+
+
+def test_wake_word_keeps_audio_from_before_speech_onset():
+    monitor = voice.WakeWordMonitor()
+    monitor.monitoring = True
+    loud = np.full((1600, 1), 0.02, dtype="float32")
+    quiet = np.zeros((1600, 1), dtype="float32")
+
+    for _ in range(2):
+        monitor._callback(quiet, 1600, None, None)
+    for _ in range(4):
+        monitor._callback(loud, 1600, None, None)
+    for _ in range(6):
+        monitor._callback(quiet, 1600, None, None)
+
+    assert len(monitor._queue) == 1
+    assert monitor._queue[0].size == 12 * 1600
+
+
 def test_stt_loads_only_models_already_available_locally(monkeypatch):
     loader = Mock()
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=loader))
@@ -209,6 +256,60 @@ def test_tts_routes_each_sentence_to_its_language():
         ("Привет, Химари!", "ru"),
         ("😊", "ru"),
     ]
+
+
+def test_tts_plays_on_the_configured_output_device(tmp_path, monkeypatch):
+    import wave
+
+    path = tmp_path / "reply.wav"
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(22050)
+        handle.writeframes(b"\x00\x00" * 10)
+    played = {}
+    fake_sd = SimpleNamespace(
+        play=lambda data, rate, device=None: played.update(rate=rate, device=device),
+        wait=lambda: None,
+        stop=lambda: None,
+    )
+    monkeypatch.setattr(voice, "sd", fake_sd)
+    monkeypatch.setattr(
+        voice,
+        "load",
+        lambda: {"voice": {"volume": 0.5, "output_device": 4}},
+    )
+
+    TTS()._play(str(path), threading.Event())
+
+    assert played["device"] == 4
+    assert played["rate"] == 22050
+
+
+def test_tts_reports_an_unavailable_output_device(tmp_path, monkeypatch):
+    import wave
+
+    path = tmp_path / "reply.wav"
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(22050)
+        handle.writeframes(b"\x00\x00" * 10)
+
+    def fail(data, rate, device=None):
+        raise OSError("no such device")
+
+    monkeypatch.setattr(
+        voice, "sd", SimpleNamespace(play=fail, wait=lambda: None, stop=lambda: None)
+    )
+    monkeypatch.setattr(
+        voice,
+        "load",
+        lambda: {"voice": {"volume": 1.0, "output_device": 99}},
+    )
+
+    with pytest.raises(RuntimeError, match="Output device 99 is unavailable"):
+        TTS()._play(str(path), threading.Event())
 
 
 def test_tts_synthesizes_complete_same_language_reply_as_one_audio_clip(tmp_path, monkeypatch):

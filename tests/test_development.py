@@ -5,16 +5,20 @@ import pytest
 
 from himari.development import (
     ChangeRejectedError,
+    EditorNotFoundError,
     WorkspaceError,
     apply_change,
+    create_project,
     discover_workspaces,
+    find_project,
     propose_change,
     read_source,
     run_tests,
+    safe_folder_name,
     search_code,
     validate_command,
 )
-from himari.development import code_search, editor, file_reader, test_runner, workspace
+from himari.development import code_search, editor, file_reader, launcher, test_runner, workspace
 
 
 @pytest.fixture()
@@ -197,3 +201,93 @@ def test_run_tests_honors_cancellation(project):
 
     with pytest.raises(RuntimeError, match="cancelled"):
         run_tests(project, approve=lambda request: True, token=token)
+
+def test_find_project_matches_a_child_folder_by_name(project):
+    webapp = project / "WebApp"
+    webapp.mkdir()
+
+    assert find_project("webapp") == webapp.resolve()
+    assert find_project(str(webapp)) == webapp.resolve()
+
+
+def test_find_project_matches_the_workspace_root(project):
+    assert find_project(project.name) == project.resolve()
+
+
+def test_find_project_rejects_ambiguous_names(project):
+    (project / "app one").mkdir()
+    (project / "app two").mkdir()
+
+    with pytest.raises(WorkspaceError, match="match"):
+        find_project("app")
+
+
+def test_find_project_rejects_paths_outside_workspaces(project, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    with pytest.raises(WorkspaceError):
+        find_project(str(outside))
+
+
+def test_find_project_reports_missing_folders(project):
+    with pytest.raises(WorkspaceError, match="No project folder"):
+        find_project("does-not-exist")
+
+
+def test_find_project_requires_configured_workspaces(monkeypatch):
+    monkeypatch.setattr(workspace, "load_config", lambda: {"development": {"workspaces": []}})
+
+    with pytest.raises(WorkspaceError, match="No development workspaces"):
+        find_project("anything")
+
+
+def test_create_project_makes_a_folder_in_the_first_workspace(project):
+    folder = create_project("new-app")
+
+    assert folder == (project / "new-app").resolve()
+    assert folder.is_dir()
+
+
+def test_create_project_rejects_traversal_and_bad_names(project, tmp_path):
+    assert safe_folder_name("app") is True
+    assert safe_folder_name("name:bad") is False
+    assert safe_folder_name("..") is False
+    assert safe_folder_name("con") is False
+
+    with pytest.raises(WorkspaceError):
+        create_project("../escape")
+    assert not (project.parent / "escape").exists()
+
+
+def test_create_project_requires_a_workspace(monkeypatch):
+    monkeypatch.setattr(workspace, "load_config", lambda: {"development": {"workspaces": []}})
+
+    with pytest.raises(WorkspaceError, match="No development workspaces"):
+        create_project("new-app")
+
+
+def test_editor_executable_uses_a_known_install(monkeypatch, tmp_path):
+    exe = tmp_path / "Code.exe"
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(launcher, "_editor_candidates", lambda: [tmp_path / "missing.exe", exe])
+
+    assert launcher.editor_executable() == exe
+
+
+def test_open_in_editor_launches_the_folder(project, monkeypatch):
+    popen = Mock()
+    monkeypatch.setattr(launcher, "editor_executable", lambda: "C:/Code/Code.exe")
+    monkeypatch.setattr(launcher.subprocess, "Popen", popen)
+
+    result = launcher.open_in_editor(project)
+
+    assert result == "C:/Code/Code.exe"
+    popen.assert_called_once_with(["C:/Code/Code.exe", str(project)])
+
+
+def test_open_in_editor_reports_a_missing_install(project, monkeypatch):
+    monkeypatch.setattr(launcher, "editor_executable", lambda: None)
+
+    with pytest.raises(EditorNotFoundError, match="not found"):
+        launcher.open_in_editor(project)

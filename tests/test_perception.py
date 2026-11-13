@@ -233,3 +233,144 @@ def test_scene_text_is_bounded(monkeypatch):
 
     assert len(result["visible_text"]) == scene.MAX_TEXT_LINES
     assert all(len(line) == scene.MAX_LINE_LENGTH for line in result["visible_text"])
+
+def test_capture_uses_the_configured_monitor(monkeypatch):
+    image = Mock()
+    capture_mock = Mock(return_value=image)
+    monkeypatch.setattr(
+        capture,
+        "load_config",
+        lambda: {
+            "permissions": {"allow_screen_capture": True},
+            "screen": {"monitor": "2"},
+        },
+    )
+    monkeypatch.setattr(capture, "capture_monitor", capture_mock)
+
+    assert capture_screen() is image
+    capture_mock.assert_called_once_with("2")
+
+
+def test_explicit_monitor_overrides_the_configured_one(monkeypatch):
+    image = Mock()
+    capture_mock = Mock(return_value=image)
+    monkeypatch.setattr(
+        capture,
+        "load_config",
+        lambda: {
+            "permissions": {"allow_screen_capture": True},
+            "screen": {"monitor": "2"},
+        },
+    )
+    monkeypatch.setattr(capture, "capture_monitor", capture_mock)
+
+    assert capture_screen(monitor="all") is image
+    capture_mock.assert_called_once_with("all")
+
+
+def test_active_window_capture_requires_its_permission(monkeypatch):
+    monkeypatch.setattr(capture, "load_config", lambda: SCREEN_ON)
+
+    with pytest.raises(CapturePermissionError, match="active-window"):
+        capture_screen(active_window=True)
+
+
+def test_active_window_capture_grabs_the_foreground_rect(monkeypatch):
+    grabbed = []
+    rect = {"left": 5, "top": 6, "width": 300, "height": 200}
+
+    class FakeMSS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def grab(self, box):
+            grabbed.append(box)
+            return SimpleNamespace(size=(2, 2), rgb=b"\x00" * 12)
+
+    monkeypatch.setattr(
+        capture,
+        "load_config",
+        lambda: {"permissions": {
+            "allow_screen_capture": True,
+            "allow_active_window": True,
+        }},
+    )
+    monkeypatch.setattr(capture, "active_window_rect", lambda: rect)
+    monkeypatch.setattr(capture, "mss", SimpleNamespace(MSS=FakeMSS))
+
+    image = capture_screen(active_window=True)
+
+    assert grabbed == [rect]
+    image.close()
+
+
+def test_configured_region_capture_grabs_the_saved_box(monkeypatch):
+    grabbed = []
+    region = {"left": 40, "top": 50, "width": 2, "height": 2}
+
+    class FakeMSS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def grab(self, box):
+            grabbed.append(box)
+            return SimpleNamespace(size=(2, 2), rgb=b"\x00" * 12)
+
+    monkeypatch.setattr(
+        capture,
+        "load_config",
+        lambda: {
+            "permissions": {"allow_screen_capture": True},
+            "screen": {"monitor": "region", "region": region},
+        },
+    )
+    monkeypatch.setattr(capture, "mss", SimpleNamespace(MSS=FakeMSS))
+
+    image = capture_screen()
+
+    assert grabbed == [region]
+    image.close()
+
+
+def test_configured_region_without_a_saved_box_is_refused(monkeypatch):
+    monkeypatch.setattr(
+        capture,
+        "load_config",
+        lambda: {
+            "permissions": {"allow_screen_capture": True},
+            "screen": {"monitor": "region"},
+        },
+    )
+    monkeypatch.setattr(capture, "mss", Mock(side_effect=AssertionError("must not capture")))
+
+    with pytest.raises(ValueError, match="No custom screen region"):
+        capture_screen()
+
+
+def test_region_accepts_a_mapping_from_the_ui(monkeypatch):
+    grabbed = []
+
+    class FakeMSS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def grab(self, box):
+            grabbed.append(box)
+            return SimpleNamespace(size=(2, 2), rgb=b"\x00" * 12)
+
+    monkeypatch.setattr(capture, "load_config", lambda: SCREEN_ON)
+    monkeypatch.setattr(capture, "mss", SimpleNamespace(MSS=FakeMSS))
+
+    image = capture_screen(region={"left": 1, "top": 2, "width": 2, "height": 2})
+
+    assert grabbed == [{"left": 1, "top": 2, "width": 2, "height": 2}]
+    image.close()

@@ -366,3 +366,118 @@ def test_executor_unknown_tool_is_denied(permissions):
     assert isinstance(result, ExecutionResult)
     assert result.status is StepStatus.DENIED
     assert "Unknown tool" in result.error
+
+
+def test_agent_reports_explicit_lifecycle_states(permissions):
+    _, manager = permissions
+    events = []
+    handler = Mock(return_value="Chrome")
+    tools = [_tool("find_app", handler, {"name": {"type": "string"}}, ["name"])]
+    planner = FakePlanner([
+        {"type": "tool", "name": "find_app", "arguments": {"name": "chrome"}},
+        {"type": "final", "content": "Chrome is installed."},
+    ])
+
+    _orchestrator(planner, tools, manager, on_status=events.append).run("Check Chrome.")
+
+    statuses = [event["status"] for event in events]
+    assert statuses[0] == "understanding"
+    assert "planning" in statuses
+    assert "executing" in statuses
+    assert "observing" in statuses
+    assert statuses[-1] == "completed"
+    assert events[-1]["verified"] is True
+    assert "every executed step succeeded" in events[-1]["detail"]
+
+
+def test_agent_reports_waiting_for_permission(permissions):
+    _, manager = permissions
+    events = []
+    handler = Mock(return_value="should not run")
+    tools = [_tool("run_command", handler, {"cmd": {"type": "string"}}, ["cmd"])]
+    planner = FakePlanner([
+        {"type": "tool", "name": "run_command", "arguments": {"cmd": "dir"}},
+        {"type": "final", "content": "I did not run the command."},
+    ])
+
+    _orchestrator(
+        planner, tools, manager,
+        confirm=lambda *args: False,
+        on_status=events.append,
+    ).run("Run dir.")
+
+    statuses = [event["status"] for event in events]
+    assert "waiting_for_permission" in statuses
+    assert "executing" not in statuses
+    assert "observing" in statuses
+
+
+def test_agent_returns_to_executing_after_permission_approval(permissions):
+    _, manager = permissions
+    events = []
+    handler = Mock(return_value="ran")
+    tools = [_tool("run_command", handler, {"cmd": {"type": "string"}}, ["cmd"])]
+    planner = FakePlanner([
+        {"type": "tool", "name": "run_command", "arguments": {"cmd": "dir"}},
+        {"type": "final", "content": "The command ran."},
+    ])
+
+    _orchestrator(
+        planner, tools, manager,
+        confirm=lambda *args: True,
+        on_status=events.append,
+    ).run("Run dir.")
+
+    statuses = [event["status"] for event in events]
+    assert (
+        statuses.index("waiting_for_permission")
+        < statuses.index("executing")
+        < statuses.index("observing")
+    )
+    handler.assert_called_once_with(cmd="dir")
+
+
+def test_completed_task_with_a_denied_step_is_marked_unverified(permissions):
+    state_config, manager = permissions
+    state_config["permissions"]["allow_open_app"] = False
+    events = []
+    handler = Mock(return_value="opened")
+    tools = [_tool("launch_app", handler, {"name": {"type": "string"}}, ["name"])]
+    planner = FakePlanner([
+        {"type": "tool", "name": "launch_app", "arguments": {"name": "Spotify"}},
+        {"type": "final", "content": "App control is disabled in Settings."},
+    ])
+
+    state = _orchestrator(
+        planner, tools, manager, on_status=events.append,
+    ).run("Open Spotify.")
+
+    assert state.status is AgentStatus.COMPLETED
+    assert state.verified is False
+    assert events[-1]["verified"] is False
+    assert "not fully verified" in events[-1]["detail"]
+
+
+def test_executor_uses_per_tool_timeout(permissions):
+    import time
+
+    _, manager = permissions
+
+    def slow_handler():
+        time.sleep(0.4)
+        return "late"
+
+    entry = _tool("find_app", slow_handler)
+    entry["timeout_seconds"] = 0.05
+    executor = Executor(
+        security=SecurityLayer(manager=manager),
+        registry=ToolRegistry([entry]),
+        timeout_seconds=5,
+    )
+
+    result = executor.execute("find_app", {})
+
+    assert result.status is StepStatus.FAILED
+    assert result.timed_out is True
+    assert "0.05 seconds" in result.error
+    assert "may still be running" in result.error

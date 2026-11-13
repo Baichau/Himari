@@ -117,6 +117,27 @@ def test_model_arguments_cannot_grant_permissions(config):
     assert decision.allowed is False
 
 
+def test_record_result_classifies_outcomes_in_the_audit_trail(monkeypatch):
+    logged = []
+    monkeypatch.setattr(
+        audit_module.db,
+        "log_action",
+        lambda tool, args, result, approved: logged.append((tool, args, result, approved)),
+    )
+    security = SecurityLayer()
+
+    security.record_result("find_app", {"name": "chrome"}, "Chrome is installed.")
+    security.record_result("open_app", {"name": "Chrome"}, "Denied: not allowed")
+
+    ok_entry = logged[-2][1]
+    failed_entry = logged[-1][1]
+    assert ok_entry["outcome"] == {"ok": True, "error": ""}
+    assert failed_entry["outcome"] == {
+        "ok": False,
+        "error": "Denied: not allowed",
+    }
+
+
 def test_audit_redacts_secrets(monkeypatch):
     logged = []
     monkeypatch.setattr(
@@ -221,9 +242,101 @@ def test_redact_value_handles_collections():
     assert redacted["items"][0]["safe"] == "value"
 
 
-def test_image_generation_is_known_low_risk_and_permission_gated():
-    from himari.security.policies import permission_key_for
+def test_screen_control_tools_are_known_and_permission_gated():
+    from himari.security.policies import (
+        NEVER_SESSION_GRANT,
+        confirmation_required_for,
+        permission_key_for,
+    )
 
-    assert tool_is_known("generate_image") is True
-    assert risk_for("generate_image") is RiskLevel.LOW
-    assert permission_key_for("generate_image") == "allow_image_generation"
+    assert tool_is_known("generate_image") is False
+    for tool in (
+        "list_controls",
+        "click_control",
+        "set_control_text",
+        "type_text",
+        "press_keys",
+        "click_at",
+        "scroll_screen",
+    ):
+        assert tool_is_known(tool) is True
+        assert permission_key_for(tool) == "allow_screen_control"
+
+    assert risk_for("list_controls") is RiskLevel.READ
+    assert risk_for("click_control") is RiskLevel.HIGH
+    assert confirmation_required_for("click_control") is True
+    assert confirmation_required_for("press_keys") is True
+    assert "press_keys" in NEVER_SESSION_GRANT
+
+def test_wait_for_decision_requires_an_explicit_yes():
+    import threading
+
+    from himari.security import wait_for_decision
+
+    unanswered = {"allowed": True, "event": threading.Event()}
+    assert wait_for_decision(unanswered, timeout=0.01) is False
+
+    approved = {"allowed": True, "event": threading.Event()}
+    approved["event"].set()
+    assert wait_for_decision(approved, timeout=0.01) is True
+
+    denied = {"allowed": False, "event": threading.Event()}
+    denied["event"].set()
+    assert wait_for_decision(denied, timeout=0.01) is False
+
+    assert wait_for_decision(None, timeout=0.01) is False
+
+
+def test_shutdown_releases_pending_confirmations_fail_closed():
+    import threading
+
+    from himari.security import (
+        new_decision,
+        release_pending_confirmations,
+        wait_for_decision,
+    )
+
+    result = new_decision()
+    answers = []
+    waiter = threading.Thread(
+        target=lambda: answers.append(wait_for_decision(result, timeout=5))
+    )
+    waiter.start()
+
+    assert release_pending_confirmations() >= 1
+    waiter.join(timeout=5)
+
+    assert not waiter.is_alive()
+    assert answers == [False]
+    assert result["allowed"] is False
+
+
+def test_resolved_decisions_are_not_released_again():
+    from himari.security import (
+        new_decision,
+        release_pending_confirmations,
+        resolve_decision,
+        wait_for_decision,
+    )
+
+    result = new_decision()
+    resolve_decision(result, True)
+
+    assert wait_for_decision(result, timeout=0.01) is True
+    release_pending_confirmations()
+    assert result["allowed"] is True
+
+
+def test_security_layer_reports_pending_confirmation(config):
+    _, manager = config
+    seen = []
+    layer = SecurityLayer(
+        confirm_callback=lambda *args: True,
+        manager=manager,
+        on_confirmation=lambda tool, risk, reason: seen.append((tool, str(risk))),
+    )
+
+    decision = layer.authorize("run_command", {"cmd": "dir"})
+
+    assert decision.allowed is True
+    assert seen == [("run_command", "high")]

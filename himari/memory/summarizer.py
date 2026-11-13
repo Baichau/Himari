@@ -31,12 +31,38 @@ def summarize_session(session, chat=None, save=True, limit=40):
     history = db.history(session, limit=limit)
     if len(history) < 2:
         return None
-    transcript = "\n".join(
-        f"{message['role']}: {message['content']}" for message in history
+    return _summarize_lines(
+        session,
+        (f"{message['role']}: {message['content']}" for message in history),
+        chat=chat,
+        save=save,
     )
+
+
+def summarize_older(session, keep_recent=32, chat=None, save=True, limit=500):
+    """Summarize everything except the newest turns so long chats keep context."""
+    rows = db.messages_detailed(session, limit=limit)
+    older = rows[:-keep_recent] if keep_recent > 0 else rows
+    older = list(reversed(older))
+    if len(older) < 6:
+        return None
+    return _summarize_lines(
+        session,
+        (f"{message['role']}: {message['content']}" for message in older),
+        chat=chat,
+        save=save,
+    )
+
+
+def _summarize_lines(session, lines, chat=None, save=True):
+    transcript = "\n".join(lines)
+    if not transcript.strip():
+        return None
     chat = chat or _default_chat
     try:
-        summary = chat([{"role": "user", "content": SUMMARY_PROMPT + transcript}])
+        summary = chat([
+            {"role": "user", "content": SUMMARY_PROMPT + transcript[-24000:]}
+        ])
     except Exception as exc:
         log.warning("Local conversation summarization failed: %s", exc)
         return None

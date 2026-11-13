@@ -101,45 +101,40 @@ def test_permission_rows_report_current_state():
     assert by_key["allowed_folders"]["enabled"] is True
 
 
-def test_permission_rows_cover_vision_and_image_generation():
+def test_permission_rows_cover_vision_and_screen_control():
     rows = permission_rows({"permissions": {"allow_vision": True}})
     by_key = {row["key"]: row for row in rows}
 
     assert by_key["allow_vision"]["enabled"] is True
     assert "vision" in by_key["allow_vision"]["description"].lower()
-    assert by_key["allow_image_generation"]["enabled"] is False
-    assert "stable diffusion" in by_key["allow_image_generation"]["description"].lower()
+    assert by_key["allow_screen_control"]["enabled"] is False
+    assert "confirmation" in by_key["allow_screen_control"]["description"].lower()
 
 
-def test_settings_accept_the_new_vision_and_image_keys():
+def test_settings_accept_the_vision_and_screen_control_keys():
     saved = {}
     service = SettingsService(load_config=lambda: dict(BASE_CONFIG), save_config=saved.update)
 
     service.update({
         "ollama": {"vision_model": "qwen2.5vl:3b", "vision_timeout_seconds": 300},
-        "imagegen": {
-            "base_url": "http://127.0.0.1:8080",
-            "steps": 28,
-            "width": 768,
-            "height": 768,
-        },
-        "permissions": {"allow_vision": True, "allow_image_generation": True},
+        "permissions": {"allow_vision": True, "allow_screen_control": True},
         "ui": {"chat_engine": "web"},
     })
 
     assert saved["ollama"]["vision_model"] == "qwen2.5vl:3b"
-    assert saved["imagegen"]["base_url"] == "http://127.0.0.1:8080"
-    assert saved["permissions"]["allow_image_generation"] is True
+    assert saved["permissions"]["allow_screen_control"] is True
     assert saved["ui"]["chat_engine"] == "web"
 
 
-def test_settings_reject_unknown_chat_engines_and_bad_image_urls():
+def test_settings_reject_unknown_chat_engines_and_removed_image_keys():
     service = SettingsService(load_config=lambda: dict(BASE_CONFIG), save_config=Mock())
 
     with pytest.raises(SettingsError):
         service.update({"ui": {"chat_engine": "native"}})
     with pytest.raises(SettingsError):
-        service.update({"imagegen": {"base_url": "127.0.0.1:8080"}})
+        service.update({"imagegen": {"base_url": "http://127.0.0.1:8080"}})
+    with pytest.raises(SettingsError):
+        service.update({"permissions": {"allow_screen_control": "yes"}})
 
 
 
@@ -268,25 +263,65 @@ def test_diagnostics_report_missing_model():
     assert "ollama pull qwen3:8b" in ollama["detail"]
 
 
-def test_diagnostics_report_the_vision_model_and_image_server():
+def test_diagnostics_report_the_vision_model():
     config = {
         **BASE_CONFIG,
         "ollama": {
             **BASE_CONFIG["ollama"],
             "vision_model": "qwen2.5vl:3b",
         },
-        "imagegen": {"base_url": "http://127.0.0.1:8080"},
     }
     checks = run_diagnostics(
         config=config,
         model_status=lambda: (["qwen3:8b", "qwen2.5vl:3b"], None),
-        image_probe=lambda url: (False, "No local image server answered."),
         include_windows=False,
     )
 
     by_name = {item["name"]: item for item in checks}
     assert by_name["Vision"]["ok"] is True
     assert "qwen2.5vl:3b" in by_name["Vision"]["detail"]
-    assert by_name["Image generation"]["ok"] is False
-    assert "No local image server" in by_name["Image generation"]["detail"]
+    assert "Image generation" not in by_name
     assert by_name["Chat rendering"]["ok"] is True
+
+
+def test_settings_accept_a_searxng_url_and_reject_a_bare_host():
+    service = SettingsService(load_config=lambda: dict(BASE_CONFIG), save_config=Mock())
+
+    updated = service.update({"research": {"searx_url": "http://127.0.0.1:8888"}})
+    assert updated["research"]["searx_url"] == "http://127.0.0.1:8888"
+
+    with pytest.raises(SettingsError):
+        service.update({"research": {"searx_url": "127.0.0.1:8888"}})
+
+
+def test_settings_round_trip_screen_control_permission():
+    service = SettingsService(load_config=lambda: dict(BASE_CONFIG), save_config=Mock())
+
+    updated = service.update({"permissions": {"allow_screen_control": True}})
+    assert updated["permissions"]["allow_screen_control"] is True
+
+    with pytest.raises(SettingsError):
+        service.update({"permissions": {"allow_screen_control": "true"}})
+
+
+def test_settings_accept_screen_areas_and_validate_regions():
+    saved = {}
+    service = SettingsService(load_config=lambda: dict(BASE_CONFIG), save_config=saved.update)
+
+    region = {"left": 10, "top": 20, "width": 300, "height": 200}
+    updated = service.update({"screen": {"monitor": "region", "region": region}})
+    assert updated["screen"]["monitor"] == "region"
+    assert updated["screen"]["region"] == region
+    assert saved["screen"]["region"] == region
+
+    assert service.update({"screen": {"monitor": "2"}})["screen"]["monitor"] == "2"
+    assert service.update({"screen": {"region": None}})["screen"]["region"] is None
+
+    with pytest.raises(SettingsError):
+        service.update({"screen": {"monitor": "third"}})
+    with pytest.raises(SettingsError):
+        service.update({"screen": {"region": {"left": 0, "top": 0, "width": 0, "height": 5}}})
+    with pytest.raises(SettingsError):
+        service.update({"screen": {"region": [0, 0, 10, 10]}})
+    with pytest.raises(SettingsError):
+        service.update({"screen": {"region": {"left": "0", "top": 0, "width": 10, "height": 10}}})

@@ -11,6 +11,7 @@ from .. import db
 from ..config import load as load_config
 from ..db import _SENSITIVE_MEMORY, _TEMPORARY_MEMORY
 from .models import CATEGORIES, Memory
+from .scoring import is_near_duplicate
 
 MAX_MEMORY_LENGTH = 500
 _LIST_COLUMNS = "id,text,source,created,approved,category,project"
@@ -69,12 +70,45 @@ class MemoryManager:
         normalized = normalize(text)
         with db._lock, db.conn() as connection:
             existing = connection.execute(
-                "SELECT id FROM memories WHERE normalized=? LIMIT 1", (normalized,)
+                "SELECT id, text, approved, category, project FROM memories "
+                "WHERE normalized=? LIMIT 1",
+                (normalized,),
             ).fetchone()
+            if existing is None:
+                for row in connection.execute(
+                    "SELECT id, text, approved, category, project FROM memories "
+                    "ORDER BY created DESC LIMIT 500"
+                ).fetchall():
+                    if is_near_duplicate(text, row["text"]):
+                        existing = row
+                        break
             if existing:
-                if approved:
+                updates = []
+                params = []
+                if approved and not existing["approved"]:
+                    updates.append("approved=1")
+                text_changed = len(text) > len(existing["text"] or "")
+                if text_changed:
+                    updates.append("text=?, normalized=?")
+                    params.extend([text, normalized])
+                if (
+                    category != "personal_context"
+                    and (existing["category"] or "personal_context") != category
+                ):
+                    updates.append("category=?")
+                    params.append(category)
+                if project and not existing["project"]:
+                    updates.append("project=?")
+                    params.append(project)
+                if updates:
+                    params.append(existing["id"])
                     connection.execute(
-                        "UPDATE memories SET approved=1 WHERE id=?", (existing["id"],)
+                        f"UPDATE memories SET {', '.join(updates)} WHERE id=?",
+                        params,
+                    )
+                if text_changed:
+                    connection.execute(
+                        "DELETE FROM memory_vectors WHERE memory_id=?", (existing["id"],)
                     )
                 return existing["id"]
             memory_id = str(uuid.uuid4())
@@ -114,6 +148,11 @@ class MemoryManager:
             ).fetchall()
         return [Memory.from_row(row) for row in rows]
 
+    def conflicts(self, limit=300):
+        from .conflicts import find_conflicts
+
+        return find_conflicts(self.list_memories(limit=limit))
+
     def update(self, memory_id, text=None, category=None, project=None):
         if text is not None:
             if not isinstance(text, str) or not text.strip():
@@ -130,6 +169,9 @@ class MemoryManager:
                 connection.execute(
                     "UPDATE memories SET text=?, normalized=? WHERE id=?",
                     (text, normalize(text), memory_id),
+                )
+                connection.execute(
+                    "DELETE FROM memory_vectors WHERE memory_id=?", (memory_id,)
                 )
             if category is not None:
                 connection.execute(
@@ -150,6 +192,7 @@ class MemoryManager:
 
     def delete(self, memory_id):
         with db._lock, db.conn() as connection:
+            connection.execute("DELETE FROM memory_vectors WHERE memory_id=?", (memory_id,))
             connection.execute("DELETE FROM memories WHERE id=?", (memory_id,))
 
 

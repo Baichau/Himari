@@ -17,7 +17,7 @@ def test_avatar_without_art_displays_an_explicit_placeholder(tmp_path):
 
     assert avatar.state == "idle"
     assert "Avatar art not installed" in avatar.text()
-    assert "AVATAR_GUIDE.md" in avatar.text()
+    assert "avatar_assets" in avatar.text()
 
     avatar.set_state("speaking")
     assert avatar.state == "speaking"

@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 from .config import APP_DIR
@@ -50,6 +51,8 @@ class AvatarWidget(QLabel):
         self._restore_blink.setSingleShot(True)
         self._restore_blink.setInterval(140)
         self._restore_blink.timeout.connect(self._restore_idle_frame)
+        self._accent = None
+        self._accent_animation = None
         self.set_state("idle")
 
     @property
@@ -77,7 +80,7 @@ class AvatarWidget(QLabel):
         else:
             self._pixmap = None
             self.clear()
-            self.setText("Avatar art not installed\nSee AVATAR_GUIDE.md")
+            self.setText("Avatar art not installed\nAdd PNGs to himari/avatar_assets")
             self.setToolTip(
                 "Add original transparent PNG sprites to the avatar_assets folder."
             )
@@ -136,6 +139,49 @@ class AvatarWidget(QLabel):
     def _restore_idle_frame(self):
         if self._state == "idle":
             self._display_frame()
+
+    def set_accent(self, color):
+        """Blend a soft state-colored ring around the sprite."""
+        target = QColor(color) if not isinstance(color, QColor) else QColor(color)
+        if not target.isValid():
+            return
+        start = QColor(self._accent) if isinstance(self._accent, QColor) else QColor(target)
+        if not self._accent_animation:
+            start.setAlpha(0)
+        else:
+            try:
+                self._accent_animation.stop()
+            except RuntimeError:
+                pass
+        self._accent = target
+        animation = QVariantAnimation(self)
+        animation.setDuration(320)
+        animation.setStartValue(start)
+        animation.setEndValue(target)
+        animation.setEasingCurve(QEasingCurve.Type.InOutSine)
+        animation.valueChanged.connect(self._apply_accent)
+        self._accent_animation = animation
+        animation.start()
+
+    def _apply_accent(self, color):
+        self._accent = QColor(color)
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not isinstance(self._accent, QColor) or self._pixmap is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        rect = self.rect().adjusted(4, 4, -5, -5)
+        glow = QColor(self._accent)
+        glow.setAlpha(34)
+        painter.setPen(QPen(glow, 7))
+        painter.drawRoundedRect(rect, 22, 22)
+        ring = QColor(self._accent)
+        ring.setAlpha(120)
+        painter.setPen(QPen(ring, 2))
+        painter.drawRoundedRect(rect, 20, 20)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:

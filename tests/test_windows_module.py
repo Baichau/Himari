@@ -393,6 +393,35 @@ def test_close_refuses_ambiguous_windows(monkeypatch):
     close_request.assert_not_called()
 
 
+def test_close_refuses_to_close_a_browser_window_by_tab_title(monkeypatch):
+    monkeypatch.setattr(launch, "load_config", lambda: ALLOWED)
+    monkeypatch.setattr(launch, "list_windows", lambda: [
+        WindowInfo(1, "Pinterest - Google Chrome", 5, "chrome.exe"),
+    ])
+    close_request = Mock()
+    monkeypatch.setattr(launch, "request_window_close", close_request)
+
+    result = close_app("Pinterest")
+
+    assert result["ok"] is False
+    assert "every tab" in result["message"]
+    close_request.assert_not_called()
+
+
+def test_close_allows_closing_the_browser_itself(monkeypatch):
+    monkeypatch.setattr(launch, "load_config", lambda: ALLOWED)
+    monkeypatch.setattr(launch, "list_windows", lambda: [
+        WindowInfo(1, "Pinterest - Google Chrome", 5, "chrome.exe"),
+    ])
+    close_request = Mock()
+    monkeypatch.setattr(launch, "request_window_close", close_request)
+
+    result = close_app("Google Chrome")
+
+    assert result["ok"] is True
+    close_request.assert_called_once_with(1)
+
+
 def test_close_sends_one_graceful_close_request(monkeypatch):
     monkeypatch.setattr(launch, "load_config", lambda: ALLOWED)
     monkeypatch.setattr(launch, "list_windows", lambda: [WindowInfo(77, "Spotify", 5, "spotify.exe")])
@@ -443,3 +472,33 @@ def test_request_window_close_posts_wm_close_only(monkeypatch):
     monkeypatch.setattr(enumeration, "_get_user32", lambda: SimpleNamespace(PostMessageW=lambda *args: 0))
     with pytest.raises(OSError):
         request_window_close(99)
+
+def test_focus_window_verifies_the_foreground_handle(monkeypatch):
+    monkeypatch.setattr(enumeration, "FOREGROUND_SETTLE_SECONDS", 0)
+    user32 = Mock()
+    user32.IsIconic.return_value = True
+    user32.GetForegroundWindow.return_value = 99
+    monkeypatch.setattr(enumeration, "_get_user32", lambda: user32)
+
+    assert enumeration.focus_window(99) is True
+    user32.ShowWindow.assert_called_once_with(99, enumeration.SW_RESTORE)
+    user32.SetForegroundWindow.assert_called_once_with(99)
+
+
+def test_focus_window_reports_when_windows_refuses(monkeypatch):
+    monkeypatch.setattr(enumeration, "FOREGROUND_SETTLE_SECONDS", 0)
+    user32 = Mock()
+    user32.IsIconic.return_value = False
+    user32.GetForegroundWindow.return_value = 12
+    monkeypatch.setattr(enumeration, "_get_user32", lambda: user32)
+
+    assert enumeration.focus_window(99) is False
+    user32.ShowWindow.assert_not_called()
+    user32.SetForegroundWindow.assert_called_once_with(99)
+
+
+def test_focus_window_requires_a_handle(monkeypatch):
+    monkeypatch.setattr(enumeration, "_get_user32", Mock(side_effect=AssertionError("no call")))
+
+    with pytest.raises(ValueError):
+        enumeration.focus_window(0)

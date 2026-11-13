@@ -11,6 +11,7 @@ def conn():
     CREATE TABLE IF NOT EXISTS memories(id TEXT PRIMARY KEY, text TEXT UNIQUE, source TEXT, created REAL, approved INTEGER DEFAULT 1);
     CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, tool TEXT, args TEXT, result TEXT, ts REAL, approved INTEGER);
     CREATE TABLE IF NOT EXISTS summaries(id TEXT PRIMARY KEY, session TEXT, text TEXT, created REAL);
+    CREATE TABLE IF NOT EXISTS memory_vectors(memory_id TEXT, model TEXT, vector TEXT, created REAL, PRIMARY KEY(memory_id,model));
     CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session,ts);
     CREATE INDEX IF NOT EXISTS idx_mem_created ON memories(created);
     CREATE INDEX IF NOT EXISTS idx_summary_session ON summaries(session,created);""")
@@ -18,10 +19,25 @@ def conn():
 def add_message(session,role,content):
     with _lock, conn() as c:
         c.execute("INSERT INTO messages VALUES(?,?,?,?,?)",(str(uuid.uuid4()),session,role,content,time.time()))
-def history(session,limit=60):
+def history(session,limit=60,max_chars=9000):
     with _lock, conn() as c:
         rows=c.execute("SELECT role,content FROM messages WHERE session=? ORDER BY ts DESC LIMIT ?",(session,limit)).fetchall()
-    return [{"role":r["role"],"content":r["content"]} for r in reversed(rows)]
+    kept=[]; total=0
+    for row in rows:
+        content=str(row["content"] or "")
+        if kept and total+len(content)>max_chars:
+            break
+        kept.append({"role":row["role"],"content":content})
+        total+=len(content)
+    return list(reversed(kept))
+
+
+def message_count(session):
+    with _lock, conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session=?", (session,)
+        ).fetchone()
+    return int(row["n"] or 0)
 
 
 def messages_detailed(session, limit=200):
@@ -69,7 +85,8 @@ def sessions(limit=40):
 def summary_for_session(session, limit=12):
     with _lock, conn() as c:
         row = c.execute(
-            "SELECT text FROM summaries WHERE session=? ORDER BY created DESC LIMIT 1",
+            "SELECT text FROM summaries WHERE session=? "
+            "ORDER BY created DESC, rowid DESC LIMIT 1",
             (session,),
         ).fetchone()
         if row:
@@ -83,12 +100,63 @@ def summary_for_session(session, limit=12):
             return ""
         return " | ".join(recent[-8:])
 
-def save_summary(session, text):
+SUMMARY_MERGE_SIMILARITY = 0.6
+MIN_MERGE_TOKENS = 6
+
+
+def _summary_tokens(text):
+    return set(re.findall(r"[^\W_]{3,}", str(text or "").casefold()))
+
+
+def _summary_similarity(left, right):
+    left_tokens = _summary_tokens(left)
+    right_tokens = _summary_tokens(right)
+    if min(len(left_tokens), len(right_tokens)) < MIN_MERGE_TOKENS:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def _merge_summary_text(old, new):
+    sentences = []
+    seen = set()
+    for chunk in re.split(r"(?<=[.!?])\s+|\n+", f"{old} {new}".strip()):
+        sentence = chunk.strip()
+        if not sentence:
+            continue
+        key = re.sub(r"\s+", " ", sentence.casefold()).rstrip(".!?")
+        if key in seen:
+            continue
+        seen.add(key)
+        sentences.append(
+            sentence if sentence.endswith((".", "!", "?")) else sentence + "."
+        )
+    return " ".join(sentences)
+
+
+def save_summary(session, text, keep=10):
     summary = (text or "").strip()
     if not summary:
         return None
     with _lock, conn() as c:
+        newest = c.execute(
+            "SELECT id, text FROM summaries WHERE session=? "
+            "ORDER BY created DESC, rowid DESC LIMIT 1",
+            (session,),
+        ).fetchone()
+        if newest and _summary_similarity(newest["text"], summary) >= SUMMARY_MERGE_SIMILARITY:
+            merged = _merge_summary_text(newest["text"], summary)
+            c.execute(
+                "UPDATE summaries SET text=?, created=? WHERE id=?",
+                (merged, time.time(), newest["id"]),
+            )
+            return merged
         c.execute("INSERT INTO summaries VALUES(?,?,?,?)", (str(uuid.uuid4()), session, summary, time.time()))
+        c.execute(
+            "DELETE FROM summaries WHERE session=? AND rowid NOT IN ("
+            "SELECT rowid FROM summaries WHERE session=? "
+            "ORDER BY created DESC, rowid DESC LIMIT ?)",
+            (session, session, max(1, int(keep))),
+        )
     return summary
 
 def search_messages(q,limit=20):
@@ -201,31 +269,41 @@ def relevant_memories(query, limit=8):
     q = (query or "").strip()
     if not q:
         return []
-    tokens = [
-        token.casefold()
-        for token in re.findall(r"[^\W_]+", q, flags=re.UNICODE)
-        if len(token) > 2
-    ]
-    if not tokens:
-        return []
-    rows = memories(limit=200)
-    ranked = []
-    for item in rows:
-        text = (item.get("text") or "").casefold()
-        score = 0
-        for token in tokens:
-            score += text.count(token)
-            if token in text:
-                score += 1
-        if score > 0:
-            ranked.append((score, item))
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [item for _, item in ranked[:limit]]
+    from .memory.scoring import rank
+
+    return rank(memories(limit=200), q, limit=limit)
 
 def delete_memory(mid):
-    with _lock, conn() as c: c.execute("DELETE FROM memories WHERE id=?",(mid,))
+    with _lock, conn() as c:
+        c.execute("DELETE FROM memory_vectors WHERE memory_id=?",(mid,))
+        c.execute("DELETE FROM memories WHERE id=?",(mid,))
 def update_memory(mid,text):
-    with _lock, conn() as c: c.execute("UPDATE memories SET text=? WHERE id=?",(text,mid))
+    with _lock, conn() as c:
+        c.execute("DELETE FROM memory_vectors WHERE memory_id=?",(mid,))
+        c.execute("UPDATE memories SET text=? WHERE id=?",(text,mid))
+def memory_vectors(model):
+    with _lock, conn() as c:
+        rows = c.execute(
+            "SELECT memory_id,vector FROM memory_vectors WHERE model=?", (model,)
+        ).fetchall()
+    vectors = {}
+    for row in rows:
+        try:
+            vectors[row["memory_id"]] = [float(value) for value in json.loads(row["vector"])]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return vectors
+def store_memory_vectors(model, vectors):
+    now = time.time()
+    with _lock, conn() as c:
+        for memory_id, vector in vectors.items():
+            c.execute(
+                "INSERT OR REPLACE INTO memory_vectors(memory_id,model,vector,created) VALUES(?,?,?,?)",
+                (memory_id, model, json.dumps([float(v) for v in vector]), now),
+            )
+def forget_memory_vector(memory_id):
+    with _lock, conn() as c:
+        c.execute("DELETE FROM memory_vectors WHERE memory_id=?", (memory_id,))
 def log_action(tool,args,result,approved):
     with _lock, conn() as c:
         c.execute("INSERT INTO actions VALUES(?,?,?,?,?,?)",(str(uuid.uuid4()),tool,json.dumps(args,default=str),str(result)[:4000],time.time(),int(approved)))

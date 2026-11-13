@@ -21,6 +21,7 @@ winrt-Windows.Media.Ocr>=3.2.1,<4
 winrt-Windows.Storage.Streams>=3.2.1,<4
 pygetwindow
 pyautogui
+pywinauto>=0.6.9
 psutil
 playwright>=1.40
 keyboard

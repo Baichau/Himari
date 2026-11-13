@@ -11,8 +11,8 @@
 - Shell execution and file writes are disabled by default. Opening apps/websites and volume control have separate Settings permissions.
 - Windows media controls have a separate Settings permission. They send media keys to the active Windows media session and cannot guarantee which application receives them or verify playback state.
 - Tool calls are bounded to five execution rounds per model turn and logged locally. Ollama requests have a configured timeout.
-- Local image generation uses only the A1111-compatible URL configured in Settings. The portable release embeds `sd-server`, its DLLs, and the SD 1.5 checkpoint in `Himari.exe`; on first use they are unpacked once into `%USERPROFILE%\.himari\imagegen` and that fixed executable is started on demand. Archive entries are restricted to the `server/` and `models/` folders and traversal paths are refused. The model cannot choose, supply, or alter the launch command. Generated images stay under `%USERPROFILE%\.himari\generated`.
-- Before a picture is rendered, Himari may ask the local Ollama endpoint to unload its configured chat and vision models to free GPU memory. Only the two configured model names are touched, and the request goes to the local Ollama host. Disable with `imagegen.free_ollama_vram`.
+- Screen control is off by default and has its own Settings permission. It reads a window's UI Automation tree and acts on a named control or confirmed point only. Every click, typed string, key combination, and scroll asks for confirmation; key combinations always ask again even after a session approval. The Windows key is refused so the agent cannot reach system-level shortcuts, password fields are never filled, and duplicate control names are reported instead of guessed. Himari never launches, closes, or kills processes through this path and never captures continuously.
+- There is no image-generation, drawing, or image-editing capability. Himari cannot call a local or remote image model, and the previous local Stable Diffusion engine is no longer installed or shipped.
 - faster-whisper only loads models from local storage; Himari does not download speech models during normal use.
 - Microphone input is used for local speech recognition and is not uploaded.
 
@@ -22,7 +22,7 @@
 
 - Every tool is assigned a risk level (READ, LOW, MEDIUM, HIGH) in `himari/security/policies.py`.
 - Unknown tools are denied by default. The model cannot grant itself permissions by passing arguments such as `{"allow": true}`; permissions come only from Settings plus in-session user approval.
-- Settings permissions (open app, open URL, web research, read/write file, screen capture, vision, image generation, active window, media control, browser automation) are checked before any risk-based decision.
+- Settings permissions (open app, open URL, web research, read/write file, screen capture, screen control, vision, active window, media control, browser automation) are checked before any risk-based decision.
 - HIGH-risk actions require explicit confirmation. Denials and approvals are audited.
 - Audit records are written to the local SQLite database with secret-looking keys and values redacted (`[redacted]`); passwords, tokens, and bearer keys are never logged.
 - Paths are validated for traversal, blocked system directories, and sensitive names/suffixes (`.env`, private keys, credential stores). Commands are validated against an allowlist of executables and must be argv lists, never raw shell strings.

@@ -111,3 +111,65 @@ def test_analyze_discards_the_capture_after_extracting_text(monkeypatch):
         pass
     else:
         raise AssertionError("The screenshot image should be closed after OCR.")
+
+
+def test_active_window_rect_reads_foreground_bounds(monkeypatch):
+    user32 = Mock()
+    user32.GetForegroundWindow.return_value = 123
+
+    def get_rect(hwnd, pointer):
+        assert hwnd == 123
+        rect = pointer._obj
+        rect.left, rect.top = 10, 20
+        rect.right, rect.bottom = 110, 220
+        return 1
+
+    user32.GetWindowRect.side_effect = get_rect
+    monkeypatch.setattr(screen.ctypes, "windll", SimpleNamespace(user32=user32))
+
+    assert screen.active_window_rect() == {
+        "left": 10, "top": 20, "width": 100, "height": 200,
+    }
+
+
+def test_active_window_rect_rejects_empty_or_missing_windows(monkeypatch):
+    user32 = Mock()
+    user32.GetForegroundWindow.return_value = 0
+    monkeypatch.setattr(screen.ctypes, "windll", SimpleNamespace(user32=user32))
+
+    try:
+        screen.active_window_rect()
+    except RuntimeError as exc:
+        assert "active window" in str(exc)
+    else:
+        raise AssertionError("No foreground window must be reported as an error.")
+
+    user32.GetForegroundWindow.return_value = 7
+
+    def get_minimized(hwnd, pointer):
+        rect = pointer._obj
+        rect.left = rect.top = rect.right = rect.bottom = 0
+        return 1
+
+    user32.GetWindowRect.side_effect = get_minimized
+    try:
+        screen.active_window_rect()
+    except RuntimeError as exc:
+        assert "minimized" in str(exc)
+    else:
+        raise AssertionError("A zero-size window must not be captured.")
+
+
+def test_analyze_can_target_another_monitor(monkeypatch):
+    image = Image.new("RGB", (2, 2), "white")
+    captured = []
+
+    def fake_capture(monitor="primary"):
+        captured.append(monitor)
+        return image
+
+    monkeypatch.setattr(screen, "capture", fake_capture)
+    monkeypatch.setattr(screen, "ocr", lambda img: "text")
+
+    assert screen.analyze(monitor="all") == "text"
+    assert captured == ["all"]

@@ -20,6 +20,7 @@ def test_done_finishes_displaying_response_before_speech():
         _persist_message=lambda role, content: events.append(("persist", role, content)),
         _render_chat=lambda force_scroll=False: events.append(("render", None)),
         _load_sessions=lambda select=None: events.append(("sessions", None)),
+        _maybe_summarize=lambda: events.append(("summarize", None)),
         _flash_expression=lambda *args, **kwargs: events.append(("flash", None)),
         _speak=lambda text: events.append(("speak", text)),
     )
@@ -29,6 +30,7 @@ def test_done_finishes_displaying_response_before_speech():
     assert events.index(("append", "assistant", "Hello there.")) < events.index(("render", None))
     assert events.index(("render", None)) < events.index(("speak", "Hello there."))
     assert ("persist", "assistant", "Hello there.") in events
+    assert ("summarize", None) in events
     assert window.busy is False
     assert window._streamed_response == ""
 
@@ -47,6 +49,7 @@ def test_done_reports_an_empty_model_reply_instead_of_speaking_nothing():
         _persist_message=lambda role, content: events.append(("persist", role, content)),
         _render_chat=lambda force_scroll=False: None,
         _load_sessions=lambda select=None: None,
+        _maybe_summarize=lambda: None,
         _flash_expression=lambda *args, **kwargs: None,
         _speak=lambda text: events.append(("speak", text)),
     )
@@ -92,17 +95,50 @@ def test_tokens_arriving_after_stop_are_ignored():
     assert window._stream_message is None
 
 
+def test_starting_push_to_talk_interrupts_speech():
+    stopped = []
+    window = SimpleNamespace(
+        mic=SimpleNamespace(rec=False, start=lambda on_silence=None: None),
+        tts=SimpleNamespace(stop=lambda: stopped.append(True)),
+        mic_btn=SimpleNamespace(setText=lambda text: None),
+        _status=lambda message: None,
+    )
+
+    UI.toggle_mic(window)
+
+    assert stopped == [True]
+
+
+def test_wake_word_interrupts_speech_before_listening():
+    stopped = []
+    window = SimpleNamespace(
+        _refresh_wake_word_status=lambda state: None,
+        _status=lambda message: None,
+        input=SimpleNamespace(setFocus=lambda: None),
+        mic=SimpleNamespace(rec=False, start=lambda on_silence=None: None),
+        mic_btn=SimpleNamespace(setText=lambda text: None),
+        tts=SimpleNamespace(stop=lambda: stopped.append(True)),
+    )
+
+    UI._wake_word_detected(window, "Himari")
+
+    assert stopped == [True]
+
+
 def test_stop_generation_sets_the_cancellation_event():
+    released = []
     window = SimpleNamespace(
         busy=True,
         _cancel_event=threading.Event(),
         stop_generation_btn=SimpleNamespace(setEnabled=lambda enabled: None),
         _status=lambda message: None,
+        _release_confirmations=lambda: released.append(True),
     )
 
     UI.stop_generation(window)
 
     assert window._cancel_event.is_set()
+    assert released == [True]
 
 
 def test_cancelled_generation_keeps_the_partial_reply():
@@ -530,3 +566,349 @@ def test_failed_reply_keeps_partial_text_and_offers_retry():
     assert ("retry", True) in events
     assert window._streamed_response == ""
     assert window.busy is False
+
+
+def test_memory_conflict_check_lists_pairs_without_changing_them(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        ui,
+        "MemoryManager",
+        lambda: SimpleNamespace(
+            conflicts=lambda: [
+                {
+                    "first": "User likes tea.",
+                    "second": "User does not like tea.",
+                    "first_id": "1",
+                    "second_id": "2",
+                    "reason": "one memory is negated",
+                }
+            ]
+        ),
+    )
+    monkeypatch.setattr(
+        ui.QMessageBox, "warning", lambda *args: warnings.append(args)
+    )
+
+    UI.check_memory_conflicts(SimpleNamespace(_status=lambda message: None))
+
+    assert warnings
+    assert "User likes tea." in warnings[0][2]
+    assert "does not like tea" in warnings[0][2]
+    assert "Nothing was changed automatically" in warnings[0][2]
+
+
+def test_memory_conflict_check_reports_a_clean_list(monkeypatch):
+    information = []
+    monkeypatch.setattr(
+        ui,
+        "MemoryManager",
+        lambda: SimpleNamespace(conflicts=lambda: []),
+    )
+    monkeypatch.setattr(
+        ui.QMessageBox, "information", lambda *args: information.append(args)
+    )
+
+    UI.check_memory_conflicts(SimpleNamespace(_status=lambda message: None))
+
+    assert information
+    assert "No likely contradictions" in information[0][2]
+
+
+def test_open_log_viewer_reuses_one_dialog(monkeypatch):
+    created = []
+
+    class FakeDialog:
+        def __init__(self, parent):
+            created.append(self)
+            self.refresh_count = 0
+            self.shown = False
+
+        def refresh(self):
+            self.refresh_count += 1
+
+        def show(self):
+            self.shown = True
+
+        def raise_(self):
+            pass
+
+        def activateWindow(self):
+            pass
+
+    monkeypatch.setattr("himari.log_viewer.LogViewerDialog", FakeDialog)
+    window = SimpleNamespace()
+
+    UI.open_log_viewer(window)
+    UI.open_log_viewer(window)
+
+    assert len(created) == 1
+    assert created[0].refresh_count == 2
+    assert created[0].shown is True
+
+
+def test_confirm_tool_answers_through_the_decision_slot(monkeypatch):
+    from himari.security import new_decision
+
+    class FakeBox:
+        Yes = ui.QMessageBox.Yes
+        No = ui.QMessageBox.No
+        Question = ui.QMessageBox.Question
+
+        def __init__(self, parent):
+            pass
+
+        def setWindowTitle(self, title):
+            pass
+
+        def setText(self, text):
+            pass
+
+        def setIcon(self, icon):
+            pass
+
+        def setStandardButtons(self, buttons):
+            pass
+
+        def setDefaultButton(self, button):
+            pass
+
+        def exec(self):
+            return self.Yes
+
+    monkeypatch.setattr(ui, "QMessageBox", FakeBox)
+    result = new_decision()
+    window = SimpleNamespace()
+
+    UI._confirm_tool(
+        window, ("open_url", {"url": "https://example.com"}, "Allow?", result)
+    )
+
+    assert result["allowed"] is True
+    assert result["event"].is_set()
+    assert window._confirm_box is None
+
+
+def test_confirm_tool_ignores_a_cancelled_request(monkeypatch):
+    from himari.security import new_decision, release_pending_confirmations
+
+    monkeypatch.setattr(ui, "QMessageBox", SimpleNamespace())
+    result = new_decision()
+    release_pending_confirmations()
+
+    UI._confirm_tool(
+        SimpleNamespace(),
+        ("open_url", {"url": "https://example.com"}, "Allow?", result),
+    )
+
+    assert result["allowed"] is False
+
+
+def test_release_confirmations_rejects_an_open_dialog(monkeypatch):
+    rejected = []
+    released = []
+    monkeypatch.setattr(
+        ui, "release_pending_confirmations", lambda: released.append(True)
+    )
+    window = SimpleNamespace(
+        _confirm_box=SimpleNamespace(reject=lambda: rejected.append(True))
+    )
+
+    UI._release_confirmations(window)
+
+    assert rejected == [True]
+    assert released == [True]
+
+
+class _Checked:
+    def __init__(self, checked=False):
+        self.checked = checked
+
+    def isChecked(self):
+        return self.checked
+
+
+class _Value:
+    def __init__(self, value):
+        self._value = value
+
+    def value(self):
+        return self._value
+
+
+class _Text:
+    def __init__(self, text=""):
+        self._text = text
+
+    def text(self):
+        return self._text
+
+
+class _Combo:
+    def __init__(self, data=None, text=""):
+        self._data = data
+        self._text = text
+
+    def currentData(self):
+        return self._data
+
+    def currentText(self):
+        return self._text
+
+    def count(self):
+        return 1 if self._text else 0
+
+
+class _Items:
+    def __init__(self, *items):
+        self._items = list(items)
+
+    def count(self):
+        return len(self._items)
+
+    def item(self, index):
+        return SimpleNamespace(text=lambda: self._items[index])
+
+
+def _settings_window():
+    window = SimpleNamespace(
+        cb_store=_Checked(True),
+        cb_auto_memory=_Checked(True),
+        cb_memory_enabled=_Checked(True),
+        cb_apps=_Checked(True),
+        cb_web=_Checked(True),
+        cb_research=_Checked(False),
+        cb_screen=_Checked(False),
+        cb_screen_control=_Checked(True),
+        cb_active_window=_Checked(False),
+        cb_media=_Checked(False),
+        cb_browser=_Checked(False),
+        cb_write=_Checked(False),
+        cb_vision=_Checked(True),
+        cb_wake=_Checked(True),
+        cb_preload=_Checked(True),
+        cb_deep_reasoning=_Checked(True),
+        cb_always_on_top=_Checked(False),
+        cb_minimize_to_tray=_Checked(True),
+        allowed_folders=_Items("C:/Docs"),
+        development_workspaces=_Items("C:/Code"),
+        reply_wait=_Value(900),
+        vol=_Value(70),
+        sensitivity=_Value(75),
+        voice_btn=_Checked(True),
+        mic_box=_Combo(data=2),
+        out_box=_Combo(data=4),
+        lang_box=_Combo(data="en"),
+        voice_box=_Combo(text="en_US-amy-medium"),
+        chat_engine_box=_Combo(data="web"),
+        vision_model_box=_Combo(text="qwen2.5vl:3b"),
+        model_box=_Combo(text="qwen3:8b"),
+        screen_area=_Combo(data="primary"),
+        _screen_region=None,
+        ollama_host=_Text("http://127.0.0.1:11434"),
+        embedding_model=_Text("nomic-embed-text"),
+        hotkey=_Text("f9"),
+        wake_word_field=_Text("Himari"),
+        screen_hotkey=_Text("f10"),
+        _recognition_language=lambda: "en",
+    )
+    window._settings_updates = lambda **kwargs: UI._settings_updates(window, **kwargs)
+    window._save_settings = lambda **kwargs: UI._save_settings(window, **kwargs)
+    window._status = lambda message: None
+    return window
+
+
+def test_settings_updates_include_text_fields_for_a_full_save():
+    updates = UI._settings_updates(_settings_window())
+
+    assert updates["ollama"]["host"] == "http://127.0.0.1:11434"
+    assert updates["ollama"]["chat_model"] == "qwen3:8b"
+    assert updates["ollama"]["vision_model"] == "qwen2.5vl:3b"
+    assert updates["permissions"]["allow_screen_control"] is True
+    assert updates["voice"]["push_to_talk_key"] == "f9"
+    assert updates["voice"]["wake_word"] == "Himari"
+    assert updates["voice"]["tts_voice"] == "en_US-amy-medium"
+    assert updates["memory"]["embedding_model"] == "nomic-embed-text"
+    assert updates["screen"]["capture_hotkey"] == "f10"
+    assert updates["screen"]["monitor"] == "primary"
+    assert updates["screen"]["region"] is None
+    assert updates["permissions"]["allow_run_command"] is False
+
+
+def test_settings_autosave_skips_partially_typed_text_fields():
+    updates = UI._settings_updates(_settings_window(), text_fields=False)
+
+    assert "host" not in updates["ollama"]
+    assert "chat_model" not in updates["ollama"]
+    assert "vision_model" not in updates["ollama"]
+    assert "push_to_talk_key" not in updates["voice"]
+    assert "wake_word" not in updates["voice"]
+    assert "capture_hotkey" not in updates["screen"]
+    assert updates["screen"]["monitor"] == "primary"
+    assert updates["screen"]["region"] is None
+    assert "memory" not in updates
+    assert "imagegen" not in updates
+    assert updates["ui"]["chat_engine"] == "web"
+    assert updates["voice"]["volume"] == 0.7
+    assert updates["voice"]["sensitivity"] == 0.75
+    assert updates["voice"]["microphone_device"] == 2
+    assert updates["voice"]["output_device"] == 4
+    assert updates["voice"]["tts_voice"] == "en_US-amy-medium"
+    assert updates["permissions"]["allowed_folders"] == ["C:/Docs"]
+
+
+def test_full_save_and_autosave_both_use_the_validated_service(monkeypatch):
+    calls = []
+
+    class FakeService:
+        def update(self, updates):
+            calls.append(updates)
+            return {}
+
+    monkeypatch.setattr(ui.control_settings, "SettingsService", FakeService)
+    window = _settings_window()
+
+    assert UI._save_settings(window, interactive=True) is True
+    assert UI._save_settings(window, interactive=False) is True
+
+    assert "host" in calls[0]["ollama"]
+    assert "screen" in calls[0]
+    assert calls[0]["screen"]["capture_hotkey"] == "f10"
+    assert "host" not in calls[1]["ollama"]
+    assert "capture_hotkey" not in calls[1]["screen"]
+    assert calls[1]["screen"]["monitor"] == "primary"
+
+
+def test_autosave_failure_warns_once_without_a_dialog(monkeypatch):
+    warnings = []
+    statuses = []
+
+    class BrokenService:
+        def update(self, updates):
+            raise ui.control_settings.SettingsError("Invalid value for voice.volume")
+
+    monkeypatch.setattr(ui.control_settings, "SettingsService", BrokenService)
+    monkeypatch.setattr(
+        ui.QMessageBox, "warning", lambda *args: warnings.append(args)
+    )
+    window = _settings_window()
+    window._status = statuses.append
+
+    assert UI._autosave_settings(window) is None
+    assert warnings == []
+    assert len(statuses) == 1
+    assert "could not be saved" in statuses[0]
+
+    UI._autosave_settings(window)
+    assert len(statuses) == 1
+
+
+def test_autosave_debounce_timer_is_started_by_widget_changes():
+    started = []
+    window = SimpleNamespace(
+        _settings_save_timer=SimpleNamespace(start=lambda: started.append(True)),
+    )
+
+    UI._schedule_settings_save(window)
+    UI._schedule_settings_save(window, False)
+
+    assert len(started) == 2

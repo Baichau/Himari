@@ -70,8 +70,9 @@ QTabBar::tab:selected {{ background-color: {p['card']}; color: {p['accent_strong
                          font-weight: 600; }}
 QTabBar::tab:hover {{ color: {p['text']}; }}
 
-QFrame#HeaderCard {{ background-color: {p['card']}; border: 1px solid {p['border']};
-                     border-radius: 16px; }}
+QFrame#HeaderCard {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                        stop:0 {p['card']}, stop:1 {p['card_alt']});
+                     border: 1px solid {p['border']}; border-radius: 16px; }}
 QFrame#Sidebar {{ background-color: {p['surface']}; border: 1px solid {p['border']};
                   border-radius: 12px; }}
 QLabel#AppTitle {{ font-size: 24px; font-weight: 700; color: {p['accent_strong']}; }}
@@ -140,6 +141,27 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 
 QMessageBox {{ background-color: {p['surface']}; }}
 QMenu {{ background-color: {p['card']}; color: {p['text']}; border: 1px solid {p['border']}; }}
+QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
 QMenu::item:selected {{ background-color: {p['accent_dim']}; color: #ffffff; }}
 QScrollArea {{ border: none; background: transparent; }}
+
+QWidget#SettingsPage {{ background: transparent; }}
+QLabel#SettingsIntro {{ color: {p['muted']}; font-size: 12px;
+                        background-color: {p['card']}; border: 1px solid {p['border']};
+                        border-radius: 10px; padding: 9px 12px; }}
+QFrame#SettingsSection {{ background-color: {p['card']}; border: 1px solid {p['border']};
+                          border-radius: 12px; }}
+QPushButton#SectionHeader {{ background: transparent; border: none; text-align: left;
+                             padding: 11px 14px; border-radius: 11px;
+                             font-weight: 700; font-size: 13px; color: {p['text']}; }}
+QPushButton#SectionHeader:hover {{ background-color: {p['card_alt']}; color: {p['accent_strong']}; }}
+QPushButton#SectionHeader:pressed {{ background-color: {p['card']}; }}
+QPushButton#SectionHeader:checked {{ background-color: transparent; color: {p['accent_strong']}; }}
+QWidget#SectionBody {{ background: transparent; }}
+QLabel#SectionHint {{ color: {p['muted']}; font-size: 11px; }}
+QPushButton#KeyCaptureButton {{ font-family: "Cascadia Mono", "Consolas", monospace;
+                                padding: 6px 12px; min-width: 96px; }}
+QPushButton#KeyCaptureButton[capturing="true"] {{ border: 1px dashed {p['accent']};
+                                                  color: {p['accent_strong']};
+                                                  background-color: {p['card_alt']}; }}
 """

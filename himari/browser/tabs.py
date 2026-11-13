@@ -17,6 +17,7 @@ SUPPORTED_ENGINES = {
     "bing": "https://www.bing.com/search?q={query}",
 }
 MAX_LISTED_TABS = 20
+MAX_OPEN_TABS = 5
 
 
 def search_url(query, engine="duckduckgo"):
@@ -72,6 +73,17 @@ def _select(manager, index):
     return pages[number - 1]
 
 
+def _is_blank(page):
+    return str(getattr(page, "url", "") or "") in {"", "about:blank"}
+
+
+def _is_search_page(page):
+    url = str(getattr(page, "url", "") or "").casefold()
+    if "duckduckgo.com/" in url:
+        return "?q=" in url or "&q=" in url
+    return "google.com/search" in url or "bing.com/search" in url
+
+
 def open_page(manager, url, new_tab=True):
     """Navigate a managed tab and return its verified title and tab number."""
     created = None
@@ -80,8 +92,14 @@ def open_page(manager, url, new_tab=True):
         new_tab
         and len(pages) == 1
         and pages[0] is manager.page
-        and str(getattr(pages[0], "url", "") or "") in {"", "about:blank"}
+        and _is_blank(pages[0])
     )
+    if new_tab and not reuse_blank and len(pages) >= MAX_OPEN_TABS:
+        raise BrowserError(
+            f"Himari's browser already has {len(pages)} tabs (the limit is "
+            f"{MAX_OPEN_TABS}). Close a tab with browser_tabs first, or reuse "
+            "the current tab with new_tab=false."
+        )
     if new_tab and not reuse_blank:
         created = manager.new_page()
         page = created
@@ -107,7 +125,14 @@ def open_page(manager, url, new_tab=True):
 
 
 def open_search(manager, query, engine="duckduckgo"):
-    return open_page(manager, search_url(query, engine), new_tab=True)
+    """Open search results, replacing a previous search page instead of stacking tabs."""
+    target = search_url(query, engine)
+    current = manager.page
+    if current is not None and not current.is_closed() and (
+        _is_blank(current) or _is_search_page(current)
+    ):
+        return open_page(manager, target, new_tab=False)
+    return open_page(manager, target, new_tab=True)
 
 
 def read_active(manager):

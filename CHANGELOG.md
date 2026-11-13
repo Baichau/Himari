@@ -2,6 +2,96 @@
 
 ## Himari 4.0 development
 
+- Desktop polish and personal shortcuts (2026-11-12):
+  - Added `himari/ui_effects.py`: window fade, tab-page fade, message pulse and animated
+    collapsible Settings cards. Chat messages now fade/slide in with a stagger, the welcome screen
+    animates and offers clickable prompt chips, scrolling is smooth for settled updates, and the
+    reduced-motion preference is honored.
+  - Rebuilt Settings as collapsible sections in `himari/ui_settings.py` (voice, screen and privacy
+    open by default; permissions, advanced and window/data folded). Removed the non-functional
+    run-command toggle and clarified labels that were misleading.
+  - New `KeyCaptureButton` (`himari/ui_widgets.py`): push-to-talk and screen-capture shortcuts are
+    recorded by pressing them, validated, saved immediately, and rebound without restarting.
+    Duplicate shortcuts are refused.
+  - New `himari/region_select.py`: drag a custom screen-capture region once; it is stored as
+    `screen.region`, validated by the Settings schema, and honored by the capture key, the Screen
+    button and `capture_screen()`.
+  - The waiting indicator now explains that the first reply after launch can be slower while the
+    local model wakes, and preload reports warming/ready states.
+  - Deleted `AVATAR_GUIDE.md`; its sprite guidance moved into the README avatar section.
+  - Offscreen window smoke test passed; full suite: **623 passed, 1 skipped**.
+
+- One request, one page (2026-11-12):
+  - `browser_open_result` now reuses the current tab by default, replacing the search page instead
+    of leaving a results tab plus a destination tab; `new_tab=true` is opt-in. Repeated searches
+    replace an existing search tab, and Himari's browser refuses to exceed five tabs.
+  - New silent `find_video` tool reads YouTube results in the background and returns titles,
+    channels, durations, and watch URLs; it opens no browser. A live check resolved a fireplace
+    request to three real watch URLs, and a stubbed model run then opened exactly one page.
+  - The persona now opens a browser only when the user asks, resolves finding tasks through
+    `research_web`/`find_video`, and forbids opening several candidates for one request.
+  - `list_windows` accepts a `name_filter` (and the `window` alias the model had tried), fixing
+    failed window-inspection calls. Full suite: **606 passed, 1 skipped**. Rebuilt the onefile at
+    610 MB; the packaged smoke test passed.
+
+- Screen control replaces image generation (2026-11-12):
+  - Removed image generation end-to-end: the A1111/ComfyUI/sd-server facade, the Images tab,
+    Settings fields, the `generate_image` tool, `IMAGE_PATH:` transport, the embedded payload,
+    local model assets, and the associated tests and documentation. Himari can no longer draw,
+    paint, or edit pictures, and the release carries no image-model weights.
+  - Added opt-in semantic screen control through Windows UI Automation (`pywinauto`):
+    `list_controls`, `click_control`, `set_control_text`, `type_text`, `press_keys`, `click_at`,
+    and `scroll_screen`. Control names come from the real window tree; duplicate names are
+    reported instead of guessed.
+  - Added the `allow_screen_control` permission (off by default) in Settings. Every input action
+    is HIGH risk and confirmed; `press_keys` always re-asks even after a session approval; the
+    Windows key and password fields are refused. Low-level input is bounded to one action per
+    call and uses Unicode key events.
+  - Diagnostics now report UI Automation availability instead of an image server. Build,
+    dependencies, persona rules, README, SECURITY, and architecture docs updated.
+    Full suite: **586 passed, 1 skipped**.
+  - Removed the local image assets under `%USERPROFILE%\.himari\imagegen` (5.9 GB) and rebuilt
+    the onefile at 610 MB (down from 2.52 GB); the packaged smoke test passed. The screen-control
+    layer was also exercised live against Windows Calculator: semantic clicks computed 1 + 2 = 3,
+    and `type_text`/`press_keys` computed 12 + 7 = 19.
+  - Deep-control pass: `open_app` now focuses an existing window instead of opening a duplicate,
+    prefers process matches over title lookalikes, and accepts a new process as launch evidence
+    within an 8 s window. Screen-control tools accept `window="active"` for duplicate titles.
+    Deep reasoning now covers app and screen actions when enabled, and the persona playbook
+    separates a launch result from a denied control step. Full suite: **591 passed, 1 skipped**.
+
+- Local-intelligence and reliability upgrade (2026-11-12):
+  - Chat correctness: `num_ctx` and bounded prompt blocks, rolling summaries, per-request
+    thinking decisions, a Mermaid directive for drawn schemas, and a prompt that plans,
+    resolves pronouns, adapts after failure, and claims only tool-confirmed actions.
+  - Tool execution: Ollama capability detection, JSON-schema validation before any handler,
+    one bounded daemon-backed invocation for chat and agent, a shared result classifier in the
+    audit trail and transcript, honest “completed (some steps unverified)” agent labels, and
+    confirmation waits that Stop/cancel/close release instead of hanging.
+  - Empty-reply retries keep the current request, assistant/tool observations (bounded), and
+    system rules instead of dropping the conversation after the user turn.
+  - Research: two intent-aware queries, readable text from up to three pages on distinct
+    domains, publication dates, numbered sources, optional self-hosted SearXNG, progress
+    events, and cancellation.
+  - Images: one provider interface for A1111/sd-server and ComfyUI, txt2img, img2img,
+    inpainting, upscaling, presets, seeds/batch, a 200-entry history, and an Images tab that
+    restores the last generation for follow-up edits.
+  - Screen and apps: configured-monitor and active-window capture, verified window focus and
+    launches, registered discovery tools, and find-or-create VS Code workspaces.
+  - Memory and voice: scored retrieval with “why retrieved” metadata, near-duplicate memory
+    merging, optional local-embedding semantic retrieval with cached vectors, summary pruning plus
+    overlapping-summary merging, report-only contradiction checks,
+    safe settings autosave, VAD-gated wake-word phrase capture, selectable microphone and
+    speaker, and push-to-talk/wake-word speech interruption.
+  - UI and operations: incremental transcript rendering, local syntax highlighting with copy
+    buttons, a single-instance guard, crash/Qt logging, an in-app log viewer, and a README/docs
+    refresh.
+  - Images (checkpoints): deterministic model choice through `imagegen.managed_model`. The managed
+    server launches the configured `.gguf` when present and logs a warning before falling back to
+    an installed checkpoint, so a larger locally installed model is not silently ignored. The
+    packaged payload still carries the small SD 1.5 checkpoint as the fallback even when a larger
+    model is installed. Full suite: **631 passed, 1 skipped**.
+
 - Wired browser automation into the chat tools. Himari can now search and open
   pages in its own visible Chrome window, open the first or Nth search result,
   read the active page, and list, focus, close, or close-other tabs in that

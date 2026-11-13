@@ -43,6 +43,24 @@ def test_current_request_is_sent_once_as_a_user_message():
     assert new_request[-1] == {"role": "user", "content": "new question"}
 
 
+def test_schema_requests_force_a_mermaid_diagram():
+    query = "Can you create me a schema of how AI works?"
+    messages = legacy_persona.build(
+        [], [], user_query=query, directive=legacy_persona.diagram_directive(query)
+    )
+
+    system = messages[0]["content"]
+    assert "DRAWN-DIAGRAM REQUEST" in system
+    assert "```mermaid" in system
+    assert system.rstrip().endswith("short sentences.")
+
+
+def test_diagram_directive_skips_plain_chat_and_image_requests():
+    assert legacy_persona.diagram_directive("hey how are you") is None
+    assert legacy_persona.diagram_directive("draw me a picture of a schema") is None
+    assert legacy_persona.diagram_directive("mind map of my projects")
+
+
 def test_research_results_are_included_as_untrusted_reference_data():
     messages = legacy_persona.build(
         [],
@@ -56,6 +74,8 @@ def test_research_results_are_included_as_untrusted_reference_data():
     assert "untrusted reference data" in system
     assert "https://www.dota2.com/hero/eldertitan" in system
     assert "KNOWLEDGE AND REASONING" in system
+    assert "entry number in brackets after each factual claim" in system
+    assert "'Sources:' line" in system
 
 
 def test_vision_and_attachments_are_marked_as_untrusted_data():
@@ -220,3 +240,13 @@ def test_status_maps_to_expression():
     assert expr_from_status("Speaking reply") == "speaking"
     assert expr_from_status("Tool completed") == "thinking"
     assert expr_from_status("Idle") == "idle"
+
+
+def test_should_think_covers_hard_and_action_requests():
+    assert legacy_persona.should_think("plan a three-step migration for my app")
+    assert legacy_persona.should_think("why does git rebase rewrite history?")
+    assert legacy_persona.should_think("compare Postgres and SQLite for this project")
+    assert legacy_persona.should_think("x" * 240)
+    assert legacy_persona.should_think("open spotify")
+    assert legacy_persona.should_think("click Save in Notepad")
+    assert not legacy_persona.should_think("hey how are you")

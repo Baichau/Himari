@@ -1,7 +1,6 @@
 param(
     [switch]$SkipTests,
     [switch]$AllowMissingSpeechAssets,
-    [switch]$AllowMissingImageAssets,
     [switch]$RequireOllama
 )
 
@@ -62,9 +61,21 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "Python syntax checks failed."
         }
-        & $python -m pytest -q tests
-        if ($LASTEXITCODE -ne 0) {
-            throw "The project test suite failed."
+        # A bracketed IPv6 NO_PROXY entry such as "[::1]" makes httpx (imported by
+        # ollama at collection time) treat the bracket as a port and fail. The app
+        # rewrites this at runtime; the test run needs it clean up front.
+        $savedNoProxy = $env:NO_PROXY
+        $savedNoProxyLower = $env:no_proxy
+        try {
+            $env:NO_PROXY = "localhost,127.0.0.1"
+            $env:no_proxy = "localhost,127.0.0.1"
+            & $python -m pytest -q tests
+            if ($LASTEXITCODE -ne 0) {
+                throw "The project test suite failed."
+            }
+        } finally {
+            $env:NO_PROXY = $savedNoProxy
+            $env:no_proxy = $savedNoProxyLower
         }
     }
 } finally {
@@ -121,15 +132,6 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "PyInstaller completed without the expected onefile executable: $exe"
 }
 
-$embedArguments = @("--exe", $exe)
-if ($AllowMissingImageAssets) {
-    $embedArguments += "--allow-missing"
-}
-& $python (Join-Path $root "embed_imagegen_payload.py") @embedArguments
-if ($LASTEXITCODE -ne 0) {
-    throw "Bundling the local image engine failed."
-}
-
 $testHome = Join-Path $env:TEMP ("himari-packaged-smoke-" + [guid]::NewGuid().ToString("N"))
 $savedHome = $env:HIMARI_HOME
 $env:HIMARI_HOME = $testHome
@@ -169,9 +171,4 @@ try {
 Write-Output "Single-file executable: $exe"
 Write-Output "Bundled Faster-Whisper models: $($stagedModels.Name -join ', ')"
 Write-Output "Bundled Piper voices: $($stagedVoices.BaseName -join ', ')"
-if ($AllowMissingImageAssets) {
-    Write-Output "Local image engine: not bundled (chat-only build)."
-} else {
-    Write-Output "Local image engine: sd-server and the Stable Diffusion checkpoint are inside the executable."
-}
 Write-Output "External runtime dependency: Ollama (install separately; prepare the selected model manually)."

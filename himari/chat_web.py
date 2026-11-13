@@ -18,12 +18,13 @@ import re
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont
-from PySide6.QtWidgets import QTextBrowser
+from PySide6.QtWidgets import QApplication, QTextBrowser
 
 from . import chat_format
 from .theme import palette as theme_palette
+from .tool_results import classify_result
 
 log = logging.getLogger("himari.chat_web")
 
@@ -221,6 +222,12 @@ def _image_card(path):
 
 def _tool_card(content):
     body = html.escape(str(content or "")[:2000])
+    succeeded, _ = classify_result(content)
+    if not succeeded:
+        return (
+            '<details class="tool tool-failed"><summary>TOOL · FAILED</summary>'
+            f"<pre>{body}</pre></details>"
+        )
     return (
         '<details class="tool"><summary>TOOL</summary>'
         f"<pre>{body}</pre></details>"
@@ -244,7 +251,8 @@ def _card(
         who = "System"
     else:
         who = str(assistant_name or "Himari")
-    body = markdown_to_html(content)
+    text = str(content or "")
+    body = markdown_to_html(text)
     if image:
         body += _image_card(image)
     body += attachment_chips_html(attachments)
@@ -252,10 +260,16 @@ def _card(
         body += '<span class="cursor">&#9615;</span>'
     stamp = _time_label(timestamp)
     stamp_html = f'<span class="time"> · {stamp}</span>' if stamp else ""
+    copy_attr = f' data-copy="{html.escape(text, quote=True)}"' if text else ""
+    copy_button = (
+        '<button class="copy-msg" type="button" title="Copy message">Copy</button>'
+        if text
+        else ""
+    )
     return (
-        f'<article class="msg {html.escape(role)}">'
+        f'<article class="msg {html.escape(role)}"{copy_attr}>'
         f'<div class="meta"><span class="who">{html.escape(who)}</span>'
-        f"{stamp_html}</div>"
+        f"{stamp_html}{copy_button}</div>"
         f'<div class="bubble">{body}</div>'
         "</article>"
     )
@@ -264,9 +278,10 @@ def _card(
 def welcome_html(name="Himari"):
     safe_name = html.escape(str(name or "Himari"))
     chips = (
-        "“Read what is on my screen”",
-        "“Draw a mind map of my project”",
-        "“Generate a picture of a rainy Tokyo street”",
+        ("What is on my screen?", "What is on my screen? Read the visible text and explain what matters."),
+        ("Open a fireplace video", "Open a fireplace video."),
+        ("Draw a mind map of my project", "Draw a mind map of my project."),
+        ("Summarize a page", "Summarize the page I have open."),
     )
     return (
         '<section class="welcome">'
@@ -274,8 +289,36 @@ def welcome_html(name="Himari"):
         "<p>Ask me to open something, read your screen, search the web, "
         "draw a diagram, or just talk. I only use tools you allow.</p>"
         '<div class="welcome-chips">'
-        + "".join(f"<span>{chip}</span>" for chip in chips)
-        + "</div></section>"
+        + "".join(
+            f'<button type="button" data-prompt="{html.escape(prompt, quote=True)}">'
+            f"{html.escape(label)}</button>"
+            for label, prompt in chips
+        )
+        + "</div>"
+        '<p class="welcome-note">The first reply after launch can take a few '
+        "seconds while the local model wakes up. Everything stays on this PC."
+        "</p></section>"
+    )
+
+
+def render_message_html(message, show_tools=False, assistant_name="Himari"):
+    """Render one message to a transcript card, or None when it is filtered out."""
+    if not isinstance(message, dict):
+        return None
+    role = str(message.get("role") or "assistant")
+    content = str(message.get("content") or "")
+    if role == "tool":
+        return _tool_card(content) if show_tools else None
+    if role not in ("user", "assistant", "error", "system"):
+        return None
+    return _card(
+        role,
+        content,
+        message.get("ts"),
+        assistant_name,
+        streaming=bool(message.get("streaming")),
+        attachments=message.get("attachments"),
+        image=message.get("image"),
     )
 
 
@@ -287,30 +330,71 @@ def render_messages_html(
 ):
     blocks = []
     for message in messages or []:
-        if not isinstance(message, dict):
-            continue
-        role = str(message.get("role") or "assistant")
-        content = str(message.get("content") or "")
-        if role == "tool":
-            if show_tools:
-                blocks.append(_tool_card(content))
-            continue
-        if role not in ("user", "assistant", "error", "system"):
-            continue
-        blocks.append(
-            _card(
-                role,
-                content,
-                message.get("ts"),
-                assistant_name,
-                streaming=bool(message.get("streaming")),
-                attachments=message.get("attachments"),
-                image=message.get("image"),
-            )
+        block = render_message_html(
+            message,
+            show_tools=show_tools,
+            assistant_name=assistant_name,
         )
+        if block is not None:
+            blocks.append(block)
     if not blocks:
         return welcome_html(assistant_name) if empty else ""
     return "".join(blocks)
+
+
+def build_render_payload(
+    messages,
+    *,
+    show_tools=False,
+    assistant_name="Himari",
+    force_scroll=False,
+    rendered_count=None,
+    rendered_streaming=False,
+):
+    """Build the JS payload for a transcript refresh.
+
+    While the last visible message streams, only that card is re-rendered so
+    the page is not rebuilt on every token. Any other change falls back to a
+    full render to keep the page consistent with the message list.
+    """
+    renderable = [
+        message
+        for message in messages or []
+        if isinstance(message, dict)
+        and message.get("role") in ("user", "assistant", "error", "system", "tool")
+        and not (message.get("role") == "tool" and not show_tools)
+    ]
+    streaming = any(bool(message.get("streaming")) for message in renderable)
+    incremental = (
+        streaming
+        and rendered_streaming
+        and rendered_count == len(renderable)
+        and bool(renderable)
+        and bool(renderable[-1].get("streaming"))
+    )
+    if incremental:
+        last = render_message_html(
+            renderable[-1],
+            show_tools=show_tools,
+            assistant_name=assistant_name,
+        )
+        if last is not None:
+            payload = {
+                "last": last,
+                "streaming": True,
+                "forceScroll": bool(force_scroll),
+            }
+            return payload, len(renderable), streaming
+    payload = {
+        "html": render_messages_html(
+            renderable,
+            show_tools=show_tools,
+            assistant_name=assistant_name,
+        ),
+        "streaming": streaming,
+        "forceScroll": bool(force_scroll),
+    }
+    return payload, len(renderable), streaming
 
 
 # ---- Page shell -----------------------------------------------------------
@@ -331,6 +415,8 @@ def _css(colors, font_size, theme_name="dark"):
   --accent-strong: {p['accent_strong']};
   --accent-dim: {p['accent_dim']};
   --code-bg: {p['code_bg']};
+  --success: {p['success']};
+  --warning: {p['warning']};
 }}
 * {{ box-sizing: border-box; }}
 html, body {{
@@ -344,13 +430,21 @@ body {{ padding: 18px 20px 30px 20px; }}
                flex-direction: column; gap: 14px; }}
 .msg {{ display: flex; flex-direction: column; }}
 .msg.user {{ align-items: flex-end; }}
+.msg.enter {{ animation: msg-in .34s cubic-bezier(.21,.75,.28,1) both; }}
+.msg.no-enter {{ animation: none; }}
+@keyframes msg-in {{
+  from {{ opacity: 0; transform: translateY(12px) scale(.995); }}
+  to {{ opacity: 1; transform: none; }}
+}}
 .meta {{ font-size: 10px; font-weight: 700; letter-spacing: .8px;
          text-transform: uppercase; color: {p['muted']};
-         margin: 0 6px 4px 6px; }}
+         margin: 0 6px 4px 6px; display: flex; align-items: center; gap: 6px; }}
 .meta .time {{ font-weight: 400; letter-spacing: 0; }}
 .bubble {{ padding: 12px 16px; border-radius: 14px; background: {p['assistant_bubble']};
            border: 1px solid {p['border']}; max-width: 100%;
-           overflow-wrap: anywhere; }}
+           overflow-wrap: anywhere;
+           transition: border-color .18s ease, box-shadow .18s ease; }}
+.msg:hover .bubble {{ box-shadow: 0 5px 20px rgba(0,0,0,.16); }}
 .msg.user .bubble {{ background: {p['user_bubble']}; border-color: {p['accent_dim']};
                      max-width: 78%; border-bottom-right-radius: 5px; }}
 .msg.assistant .bubble {{ border-left: 3px solid {p['accent']};
@@ -383,6 +477,32 @@ body {{ padding: 18px 20px 30px 20px; }}
 .bubble pre {{ background: {p['code_bg']}; border: 1px solid {p['border']};
   border-radius: 9px; padding: 10px 12px; overflow: auto; margin: 10px 0; }}
 .bubble pre code {{ background: none; border: none; padding: 0; }}
+.code-block {{ background: {p['code_bg']}; border: 1px solid {p['border']};
+  border-radius: 9px; margin: 10px 0; overflow: hidden; }}
+.code-block pre {{ background: none; border: none; border-radius: 0;
+  margin: 0; padding: 10px 12px; }}
+.code-bar {{ display: flex; align-items: center; justify-content: space-between;
+  padding: 3px 6px 3px 12px; border-bottom: 1px solid {p['border']};
+  background: {p['card']}; }}
+.code-lang {{ color: {p['muted']}; font-size: .68em; font-weight: 700;
+  letter-spacing: .8px; text-transform: uppercase; }}
+.copy-code, .copy-msg {{ font: inherit; background: transparent;
+  color: {p['muted']}; border: 1px solid transparent; border-radius: 5px;
+  padding: 1px 7px; cursor: pointer; opacity: 0;
+  transition: opacity .12s ease, color .12s ease; }}
+.copy-msg {{ margin-left: auto; font-size: 9px; font-weight: 600;
+  letter-spacing: .5px; text-transform: uppercase; }}
+.code-block:hover .copy-code, .msg:hover .copy-msg,
+.copy-code:focus, .copy-msg:focus {{ opacity: 1; }}
+.copy-code:hover, .copy-msg:hover {{ color: {p['accent_strong']};
+  border-color: {p['border']}; }}
+.copy-failed {{ color: {p['warning']} !important; }}
+.tok-com {{ color: {p['muted']}; font-style: italic; }}
+.tok-str {{ color: {p['success']}; }}
+.tok-kw {{ color: {p['accent_strong']}; }}
+.tok-num {{ color: {p['warning']}; }}
+.tok-fn {{ color: {p['accent']}; }}
+.tok-var {{ color: {p['warning']}; }}
 .bubble table {{ border-collapse: collapse; margin: 10px 0; width: 100%;
   font-size: .95em; }}
 .bubble th, .bubble td {{ border: 1px solid {p['border']}; padding: 6px 10px;
@@ -430,16 +550,35 @@ details.tool {{ background: {p['tool_bubble']}; border: 1px solid {p['border']};
   color: {p['muted']}; }}
 details.tool summary {{ cursor: pointer; font-size: .78em; font-weight: 700;
   letter-spacing: .8px; }}
+details.tool-failed {{ border-color: {p['warning']}; }}
+details.tool-failed summary {{ color: {p['warning']}; }}
 details.tool pre {{ margin: 6px 0 0 0; white-space: pre-wrap;
   font-family: "Cascadia Mono", Consolas, monospace; background: none;
   border: none; padding: 0; color: {p['muted']}; }}
 
-.welcome {{ margin: 60px auto 0 auto; max-width: 620px; text-align: left; }}
+.welcome {{ margin: 60px auto 0 auto; max-width: 620px; text-align: left;
+  animation: welcome-in .5s cubic-bezier(.21,.75,.28,1) both; }}
+@keyframes welcome-in {{
+  from {{ opacity: 0; transform: translateY(16px); }}
+  to {{ opacity: 1; transform: none; }}
+}}
 .welcome h1 {{ font-size: 1.7em; margin: 0 0 10px 0; color: {p['accent_strong']}; }}
 .welcome p {{ color: {p['text']}; margin: 0 0 16px 0; }}
+.welcome p.welcome-note {{ color: {p['muted']}; font-size: .82em; margin-top: 4px; }}
 .welcome-chips {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-.welcome-chips span {{ background: {p['card']}; border: 1px solid {p['border']};
-  border-radius: 999px; padding: 6px 12px; font-size: .84em; color: {p['muted']}; }}
+.welcome-chips button, .welcome-chips span {{
+  font: inherit; background: {p['card']}; border: 1px solid {p['border']};
+  border-radius: 999px; padding: 6px 12px; font-size: .84em; color: {p['muted']};
+  cursor: pointer; transition: border-color .16s ease, color .16s ease,
+  background-color .16s ease, transform .16s ease; }}
+.welcome-chips button:hover {{
+  border-color: {p['accent']}; color: {p['text']};
+  background: {p['card_alt']}; transform: translateY(-1px); }}
+.welcome-chips button:active {{ transform: translateY(0); }}
+@media (prefers-reduced-motion: reduce) {{
+  .msg.enter, .welcome {{ animation: none; }}
+  .welcome-chips button, .bubble {{ transition: none; }}
+}}
 
 ::-webkit-scrollbar {{ width: 10px; height: 10px; }}
 ::-webkit-scrollbar-track {{ background: transparent; }}
@@ -532,6 +671,9 @@ except Exception as exc:  # pragma: no cover - depends on the Qt build
 if WEB_ENGINE_AVAILABLE:
 
     class _ChatPage(QWebEnginePage):
+        copyRequested = Signal(str)
+        fillRequested = Signal(str)
+
         def acceptNavigationRequest(self, url, nav_type, is_main_frame):
             scheme = url.scheme().lower()
             link_clicked = (
@@ -542,8 +684,19 @@ if WEB_ENGINE_AVAILABLE:
                 return False
             return scheme in ("about", "file", "data", "")
 
+        def javaScriptPrompt(self, securityOrigin, msg, defaultValue):
+            if msg == "himari-copy":
+                self.copyRequested.emit(str(defaultValue or ""))
+                return (True, "1")
+            if msg == "himari-fill":
+                self.fillRequested.emit(str(defaultValue or ""))
+                return (True, "1")
+            return (False, "")
+
     class ChatWebView(QWebEngineView):
         """Transcript view backed by a local, script-locked web page."""
+
+        fillRequested = Signal(str)
 
         def __init__(
             self,
@@ -559,6 +712,8 @@ if WEB_ENGINE_AVAILABLE:
             self._theme_name = str(theme_name)
             self._ready = False
             self._pending = None
+            self._rendered_count = None
+            self._rendered_streaming = False
             self.setObjectName("ChatView")
             self._profile = QWebEngineProfile(self)
             self._page = _ChatPage(self._profile, self)
@@ -585,12 +740,17 @@ if WEB_ENGINE_AVAILABLE:
                 except Exception:  # pragma: no cover - attribute exists in Qt 6
                     pass
             self.page().setBackgroundColor(QColor(self._colors["surface"]))
+            self._page.copyRequested.connect(self._copy_requested)
+            self._page.fillRequested.connect(self.fillRequested)
             self.loadFinished.connect(self._on_loaded)
             base = QUrl.fromLocalFile(str(ASSETS_DIR) + "/")
             self.setHtml(
                 shell_html(self._colors, self._font_size, self._theme_name),
                 base,
             )
+
+        def _copy_requested(self, text):
+            QApplication.clipboard().setText(str(text))
 
         def _on_loaded(self, ok):
             self._ready = bool(ok)
@@ -600,6 +760,9 @@ if WEB_ENGINE_AVAILABLE:
             if self._pending is not None:
                 payload, self._pending = self._pending, None
                 self._apply(payload)
+            self.page().runJavaScript(
+                "window.himari && window.himari.enableBridge();"
+            )
 
         def render_messages(
             self,
@@ -609,19 +772,14 @@ if WEB_ENGINE_AVAILABLE:
             colors=None,
             force_scroll=False,
         ):
-            streaming = any(
-                isinstance(message, dict) and message.get("streaming")
-                for message in messages or []
+            payload, self._rendered_count, self._rendered_streaming = build_render_payload(
+                messages,
+                show_tools=show_tools,
+                assistant_name=assistant_name,
+                force_scroll=force_scroll,
+                rendered_count=self._rendered_count,
+                rendered_streaming=self._rendered_streaming,
             )
-            payload = {
-                "html": render_messages_html(
-                    messages,
-                    show_tools=show_tools,
-                    assistant_name=assistant_name,
-                ),
-                "streaming": streaming,
-                "forceScroll": bool(force_scroll),
-            }
             if self._ready:
                 self._apply(payload)
             else:

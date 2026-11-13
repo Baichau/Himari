@@ -37,9 +37,10 @@ PERMISSION_LABELS = {
         "Image understanding",
         "Send attached or captured images to the local Ollama vision model on Send.",
     ),
-    "allow_image_generation": (
-        "Local image generation",
-        "Generate pictures with a Stable Diffusion server running on this PC.",
+    "allow_screen_control": (
+        "Screen control",
+        "Click named controls, type text, and send key presses to open windows. "
+        "Every input action asks for confirmation.",
     ),
     "allow_active_window": (
         "Active-window detection",

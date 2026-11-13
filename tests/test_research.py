@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -72,7 +73,7 @@ def test_research_results_are_cached(monkeypatch):
     monkeypatch.setattr(
         research,
         "research_web",
-        lambda query: calls.append(query) or "Web results for: x\nSource: https://example.com",
+        lambda query, **kwargs: calls.append(query) or "Web results for: x\nSource: https://example.com",
     )
 
     assert research.research_for_prompt("who's elder titan in dota")
@@ -87,7 +88,7 @@ def test_research_is_skipped_when_permission_is_disabled(monkeypatch):
         "load",
         lambda: {"permissions": {"allow_web_research": False}},
     )
-    monkeypatch.setattr(research, "research_web", lambda query: calls.append(query))
+    monkeypatch.setattr(research, "research_web", lambda query, **kwargs: calls.append(query))
 
     assert research.research_for_prompt("who's elder titan in dota") is None
     assert calls == []
@@ -103,7 +104,7 @@ def test_failed_research_is_not_cached(monkeypatch):
     monkeypatch.setattr(
         research,
         "research_web",
-        lambda query: calls.append(query) or "Web research failed: problem",
+        lambda query, **kwargs: calls.append(query) or "Web research failed: problem",
     )
 
     assert research.research_for_prompt("who's elder titan in dota").startswith("Web research failed")
@@ -112,11 +113,13 @@ def test_failed_research_is_not_cached(monkeypatch):
 
 
 def _run_prepare(monkeypatch, *, deep_reasoning=True):
+    research_calls = []
     monkeypatch.setattr(ui, "should_research", lambda text: True)
     monkeypatch.setattr(
         ui,
         "research_for_prompt",
-        lambda text: "Web results for: x\nSource: https://example.com",
+        lambda text, **kwargs: research_calls.append(kwargs)
+        or "Web results for: x\nSource: https://example.com",
     )
     monkeypatch.setattr(ui.db, "relevant_memories", lambda *args, **kwargs: [])
     monkeypatch.setattr(ui.db, "summary_for_session", lambda *args, **kwargs: None)
@@ -153,16 +156,14 @@ def _run_prepare(monkeypatch, *, deep_reasoning=True):
         ),
     )
 
-    import threading
-
     ui.UI._prepare_and_run(
         window, "who's elder titan in dota", None, [], threading.Event()
     )
-    return built, statuses, ran, window
+    return built, statuses, ran, window, research_calls
 
 
 def test_research_is_injected_before_the_model_call(monkeypatch):
-    built, statuses, ran, window = _run_prepare(monkeypatch)
+    built, statuses, ran, window, _ = _run_prepare(monkeypatch)
 
     assert built["research"].startswith("Web results for:")
     assert ran == [(["messages"], True)]
@@ -170,8 +171,17 @@ def test_research_is_injected_before_the_model_call(monkeypatch):
     assert window._waiting_label == "Thinking deeply about your question…"
 
 
+def test_research_receives_cancellation_and_progress(monkeypatch):
+    _, statuses, _, _, calls = _run_prepare(monkeypatch)
+
+    assert len(calls) == 1
+    assert isinstance(calls[0]["cancel"], threading.Event)
+    calls[0]["progress"]("Searching: probe")
+    assert statuses[-1] == "Searching: probe"
+
+
 def test_deep_reasoning_can_be_turned_off_in_settings(monkeypatch):
-    _, _, ran, window = _run_prepare(monkeypatch, deep_reasoning=False)
+    _, _, ran, window, _ = _run_prepare(monkeypatch, deep_reasoning=False)
 
     assert ran == [(["messages"], False)]
     assert window._waiting_label == "Thinking through your question…"

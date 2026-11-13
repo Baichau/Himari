@@ -32,12 +32,14 @@ def redact_value(value):
     return value
 
 
-def audit(tool, risk, arguments, decision, result=None):
+def audit(tool, risk, arguments, decision, result=None, outcome=None):
     entry = {
         "risk": str(risk) if isinstance(risk, RiskLevel) else str(risk),
         "decision": decision.to_dict() if hasattr(decision, "to_dict") else decision,
         "arguments": redact_value(arguments or {}),
     }
+    if outcome is not None:
+        entry["outcome"] = outcome
     db.log_action(
         tool,
         entry,
