@@ -35,11 +35,12 @@
     unregistered `open_project` tool now has its risk, permission and confirmation entries.
   - Full suite: **777 passed, 1 skipped**; offscreen construction of the whole window with all
     eight screens, the watch indicator and both new cards verified.
-  - Packaged portable build produced on 2026-11-14: `release\Himari.exe` (610,123,837 bytes,
-    SHA-256 `1065C74D9F0F25FF67DBE05D72728FEA8E45616DF8090C76F82C51E6A65594F1`), bundling
+  - Packaged portable build produced on 2026-11-14: `release\Himari.exe` (610,123,231 bytes,
+    SHA-256 `0E91FB1E00065A9BFD31D5F00FF0A81B7BBC76D6DF12DBC3AD3A45BE703A2261`), bundling
     `base.en` and `en_US-amy-medium`; the packaged `--self-test --gui` smoke test passed and the
-    source ZIP was refreshed as `release\Himari-source-4.0.zip`. The previous executable is kept
-    as `release\Himari-previous-build-2026-11-14-1222.exe`.
+    source ZIP was refreshed as `release\Himari-source-5.0.zip`. Published as GitHub release
+    `v5.0` with both files as downloadable assets; the superseded executables were removed
+    locally afterwards.
 
 ## Himari 4.0 development
 
