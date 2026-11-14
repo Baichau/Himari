@@ -122,18 +122,35 @@ def test_explicit_memory_requests_support_common_phrasings(tmp_path):
         db.APP_DIR = tmp_path
         db.DB = tmp_path / "himari.db"
 
-        assert db.suggest_memory("Keep in mind that I use Windows 11.")
-        assert db.suggest_memory("Don't forget that I prefer short answers.")
-        assert db.suggest_memory("Note that my project is Himari.")
-        assert db.suggest_memory("Запомни, что я предпочитаю русский язык.")
+        assert db.remember_request("Keep in mind that I use Windows 11.")
+        assert db.remember_request("Don't forget that I prefer short answers.")
+        assert db.remember_request("Note that my project is Himari.")
+        assert db.remember_request("Запомни, что я предпочитаю русский язык.")
 
-        texts = {item["text"] for item in db.memory_suggestions()}
+        texts = {item["text"] for item in db.memories()}
         assert "I use Windows 11." in texts
         assert "I prefer short answers." in texts
         assert "my project is Himari." in texts
         assert "я предпочитаю русский язык." in texts
         assert db.memory_is_sensitive("Call me at 555-123-4567") is True
         assert db.memory_is_sensitive("I prefer short answers.") is False
+    finally:
+        db.APP_DIR = original_dir
+        db.DB = original_db
+
+
+def test_legacy_memory_suggestions_are_upgraded_on_startup(tmp_path):
+    original_dir = db.APP_DIR
+    original_db = db.DB
+    try:
+        db.APP_DIR = tmp_path
+        db.DB = tmp_path / "himari.db"
+        db.add_memory("I use Windows 11.", source="suggestion", approved=0)
+
+        assert db.memories() == []
+        assert db.approve_legacy_suggestions() == 1
+        assert db.memories()[0]["text"] == "I use Windows 11."
+        assert db.approve_legacy_suggestions() == 0
     finally:
         db.APP_DIR = original_dir
         db.DB = original_db
@@ -174,29 +191,27 @@ def test_add_memory_deduplicates_casefolded_text(tmp_path):
         db.DB = original_db
 
 
-def test_memory_suggestions_need_approval_and_reject_sensitive_or_temporary_facts(tmp_path):
+def test_memory_requests_are_remembered_immediately_and_reject_sensitive_or_temporary_facts(tmp_path):
     original_dir = db.APP_DIR
     original_db = db.DB
     try:
         db.APP_DIR = tmp_path
         db.DB = tmp_path / "himari.db"
 
-        suggestion_id = db.suggest_memory(
+        memory_id = db.remember_request(
             "Please remember that I prefer Russian replies."
         )
 
-        assert suggestion_id
-        assert db.memories() == []
-        assert db.memory_suggestions()[0]["text"] == "I prefer Russian replies."
-        assert db.suggest_memory("Remember that my password is hunter2") is None
-        assert db.suggest_memory("Remember that my email address is me@example.com") is None
-        assert db.suggest_memory("Remember that I need this today") is None
-        assert db.suggest_memory("I prefer Russian replies") is None
-
-        db.add_memory("I prefer Russian replies.", source="user", approved=1)
-
-        assert db.memory_suggestions() == []
+        assert memory_id
         assert db.memories()[0]["text"] == "I prefer Russian replies."
+        assert db.memory_suggestions() == []
+        assert db.remember_request("Remember that my password is hunter2") is None
+        assert db.remember_request("Remember that my email address is me@example.com") is None
+        assert db.remember_request("Remember that I need this today") is None
+        assert db.remember_request("I prefer Russian replies") is None
+
+        assert db.remember_request("Please remember that I prefer Russian replies.") == memory_id
+        assert len(db.memories()) == 1
     finally:
         db.APP_DIR = original_dir
         db.DB = original_db
@@ -223,6 +238,25 @@ def test_sessions_are_grouped_and_titled_from_the_first_user_message(tmp_path):
         detailed = db.messages_detailed("first-chat")
         assert [message["role"] for message in detailed] == ["user", "assistant"]
         assert all("ts" in message for message in detailed)
+    finally:
+        db.APP_DIR = original_dir
+        db.DB = original_db
+
+
+def test_history_defaults_keep_a_deep_recent_window(tmp_path):
+    original_dir = db.APP_DIR
+    original_db = db.DB
+    try:
+        db.APP_DIR = tmp_path
+        db.DB = tmp_path / "himari.db"
+        for index in range(100):
+            db.add_message("deep", "user", f"short {index}")
+
+        rows = db.history("deep")
+
+        assert len(rows) == 80
+        assert rows[-1]["content"] == "short 99"
+        assert rows[0]["content"] == "short 20"
     finally:
         db.APP_DIR = original_dir
         db.DB = original_db

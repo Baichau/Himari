@@ -97,10 +97,36 @@ SCHEMA = {
         "monitor": _screen_area,
         "capture_hotkey": _is_text,
         "region": _region,
+        "watch_interval_seconds": _number(10, 60),
+        "watch_max_minutes": _number(1, 30),
+    },
+    "coach": {
+        "completed": _is_text_list,
     },
     "research": {
         "searx_url": lambda value: isinstance(value, str)
         and (not value.strip() or value.strip().startswith(("http://", "https://"))),
+    },
+    "spotify": {
+        "client_id": lambda value: isinstance(value, str),
+        "client_secret": lambda value: isinstance(value, str),
+        "market": lambda value: isinstance(value, str)
+        and (not value.strip() or (len(value.strip()) == 2 and value.strip().isalpha())),
+    },
+    "location": {
+        "city": lambda value: isinstance(value, str),
+        "latitude": lambda value: value is None or _number(-90, 90)(value),
+        "longitude": lambda value: value is None or _number(-180, 180)(value),
+        "units": _one_of(("metric", "imperial")),
+        "auto_detect": _is_bool,
+    },
+    "reasoning": {
+        "profile": _one_of(("auto", "direct", "guided", "deep")),
+        "auto_escalate": _is_bool,
+        "max_rounds": _number(1, 30),
+    },
+    "calendar": {
+        "default_duration_minutes": _number(5, 1440),
     },
     "memory": {
         "embedding_model": lambda value: isinstance(value, str),
@@ -124,6 +150,10 @@ SCHEMA = {
         "allow_run_command": _is_bool,
         "allow_write_file": _is_bool,
         "allow_browser_automation": _is_bool,
+        "allow_watch_mode": _is_bool,
+        "allow_system_diagnostics": _is_bool,
+        "allow_vscode_state": _is_bool,
+        "allow_run_tests": _is_bool,
         "allowed_folders": _is_text_list,
     },
     "ui": {

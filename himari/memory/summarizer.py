@@ -8,8 +8,12 @@ from ..config import load as load_config
 log = logging.getLogger("himari.memory")
 
 SUMMARY_PROMPT = (
-    "Summarize the following conversation in 3-5 short factual sentences. "
-    "Only include information stated by the user. Do not invent details.\n\n"
+    "Write a compact memory of this conversation for the assistant to reuse later. "
+    "Cover, in at most 180 words: who the user is here, what they asked for, "
+    "decisions and preferences they stated, tasks that are done or still open, "
+    "names, numbers, paths and links they mentioned, and promises the assistant "
+    "made. Keep it factual and third-person; never invent details. "
+    "Write short lines, one topic per line.\n\n"
 )
 
 

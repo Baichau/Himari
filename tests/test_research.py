@@ -16,17 +16,44 @@ def clear_query_cache():
 @pytest.mark.parametrize(
     "text",
     [
-        "who's elder titan in dota",
-        "what is Nabeghlavi water?",
         "can you search who is Elder Titan in Dota 2",
         "latest news about Dota 2",
-        "explain quantum computing",
-        "tell me about Elder Titan in Dota 2",
         "who is the president of Georgia",
+        "what's the weather today",
+        "double-check the release date of the next patch",
+        "is it true that Nabeghlavi helps digestion?",
     ],
 )
-def test_factual_questions_are_researched(text):
+def test_explicit_and_time_sensitive_questions_are_researched(text):
     assert research.should_research(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "what day is it today",
+        "also can u check what day is it today",
+        "what's the date today",
+        "what time is it now",
+        "current date",
+    ],
+)
+def test_local_date_and_time_questions_skip_the_web(text):
+    assert research.should_research(text) is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "who's elder titan in dota",
+        "what is Nabeghlavi water?",
+        "explain quantum computing",
+        "tell me about Elder Titan in Dota 2",
+        "compare Postgres and SQLite for this project",
+    ],
+)
+def test_stable_knowledge_answers_without_a_web_lookup(text):
+    assert research.should_research(text) is False
 
 
 @pytest.mark.parametrize(
@@ -76,9 +103,9 @@ def test_research_results_are_cached(monkeypatch):
         lambda query, **kwargs: calls.append(query) or "Web results for: x\nSource: https://example.com",
     )
 
-    assert research.research_for_prompt("who's elder titan in dota")
-    assert research.research_for_prompt("who's elder titan in dota")
-    assert calls == ["who's elder titan in dota"]
+    assert research.research_for_prompt("latest news about Dota 2")
+    assert research.research_for_prompt("latest news about Dota 2")
+    assert calls == ["latest news about Dota 2"]
 
 
 def test_research_is_skipped_when_permission_is_disabled(monkeypatch):
@@ -90,7 +117,7 @@ def test_research_is_skipped_when_permission_is_disabled(monkeypatch):
     )
     monkeypatch.setattr(research, "research_web", lambda query, **kwargs: calls.append(query))
 
-    assert research.research_for_prompt("who's elder titan in dota") is None
+    assert research.research_for_prompt("latest news about Dota 2") is None
     assert calls == []
 
 
@@ -107,8 +134,8 @@ def test_failed_research_is_not_cached(monkeypatch):
         lambda query, **kwargs: calls.append(query) or "Web research failed: problem",
     )
 
-    assert research.research_for_prompt("who's elder titan in dota").startswith("Web research failed")
-    assert research.research_for_prompt("who's elder titan in dota").startswith("Web research failed")
+    assert research.research_for_prompt("latest news about Dota 2").startswith("Web research failed")
+    assert research.research_for_prompt("latest news about Dota 2").startswith("Web research failed")
     assert len(calls) == 2
 
 
@@ -151,13 +178,13 @@ def _run_prepare(monkeypatch, *, deep_reasoning=True):
         cancelled=SimpleNamespace(emit=lambda *args: None),
         failed=SimpleNamespace(emit=lambda *args: None),
         _waiting_label="Waiting for Ollama…",
-        _run=lambda messages, cancel_event, think=False: ran.append(
+        _run=lambda messages, cancel_event, think=False, tools=None: ran.append(
             (messages, think)
         ),
     )
 
     ui.UI._prepare_and_run(
-        window, "who's elder titan in dota", None, [], threading.Event()
+        window, "plan a three-step migration for my app", None, [], threading.Event()
     )
     return built, statuses, ran, window, research_calls
 

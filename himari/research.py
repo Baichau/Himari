@@ -17,16 +17,6 @@ _SEARCH_REQUEST = re.compile(
     r"(?:search|look\s+up|research|find\s+out|google)\b",
     re.I,
 )
-_QUESTION_START = re.compile(
-    r"^(?:hey\s+himari[,\s]*)?(?:please\s+)?(?:"
-    r"who(?:'s| is| was| are)|what(?:'s| is| was| are)|"
-    r"when(?:'s| is| was| were)|where(?:'s| is| was| are)|"
-    r"why\b|how\b|which\b|whose\b|whom\b|"
-    r"is\b|are\b|was\b|were\b|does\b|did\b|could\b|should\b|"
-    r"tell\s+me\s+about|explain\b|search\b|look\s+up\b|research\b|find\s+out\b"
-    r")",
-    re.I,
-)
 _LOCAL_START = re.compile(
     r"^(?:hey\s+himari[,\s]*)?(?:please\s+)?(?:"
     r"hi\b|hello\b|hey\b|thanks\b|thank\s+you\b|good\s+(?:morning|night|evening)\b|"
@@ -55,11 +45,25 @@ _HOW_LOCAL = re.compile(
     r"maximize|minimize|mute|screenshot|capture|change|find|get)\b",
     re.I,
 )
-_RESEARCH_HINT = re.compile(
-    r"\b(?:latest|news|today|current|currently|release\s+date|"
-    r"who(?:'s| is| was)|what(?:'s| is| was)|where(?:'s| is| was)|"
-    r"when(?:'s| is| was)|tell\s+me\s+about|explain|compare|review|"
-    r"price|weather|score|schedule|meaning|history|biography)\b",
+_RECENCY = re.compile(
+    r"\b(?:latest|news|today|tonight|currently|current|right now|"
+    r"this\s+(?:week|month|year)|release\s+date|price|weather|forecast|"
+    r"score|schedule|who\s+won|election|president|prime\s+minister|"
+    r"chancellor|ceo|stock|market|patch\s+notes|just\s+(?:released|announced)|"
+    r"20(?:2[5-9]|3\d))\b",
+    re.I,
+)
+_VERIFY = re.compile(
+    r"\b(?:is\s+it\s+true|fact[- ]?check|verify|double[- ]?check|"
+    r"check\s+(?:if|whether)|source|cite)\b",
+    re.I,
+)
+_DATE_TIME = re.compile(
+    r"\b(?:what|which)\s+(?:day|date|time)\s+(?:is\s+it|is\s+today|today|now)\b"
+    r"|\bwhat'?s\s+(?:the\s+)?(?:date|day|time)\s+(?:today|now)\b"
+    r"|\btoday'?s\s+(?:date|day|day\s+of\s+the\s+week)\b"
+    r"|\bwhat\s+day\s+is\s+(?:it|today)\b"
+    r"|\bcurrent\s+(?:date|time|day)\b",
     re.I,
 )
 _CLEAN_PREFIX = re.compile(
@@ -100,6 +104,8 @@ def should_research(text):
         return False
     if _SEARCH_REQUEST.match(text):
         return True
+    if _DATE_TIME.search(text):
+        return False
     if _HOW_LOCAL.search(text):
         return False
     if _LOCAL_REFERENCE.search(text):
@@ -108,7 +114,7 @@ def should_research(text):
         return False
     if _LOCAL_START.match(text):
         return False
-    return bool(_QUESTION_START.match(text) or _RESEARCH_HINT.search(text))
+    return bool(_RECENCY.search(text) or _VERIFY.search(text))
 
 
 def research_for_prompt(text, *, cancel=None, progress=None):

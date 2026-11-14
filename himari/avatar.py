@@ -1,9 +1,11 @@
+import math
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import QEasingCurve, QPointF, Qt, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QRadialGradient
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
+from .ambient import reduced_motion_enabled
 from .config import APP_DIR
 
 _STATES = {
@@ -11,10 +13,29 @@ _STATES = {
     "listening": "Listening",
     "thinking": "Thinking",
     "speaking": "Speaking",
+    "searching": "Searching",
+    "working": "Working",
     "happy": "Happy",
     "confused": "Confused",
+    "success": "Success",
     "sad": "Sad",
     "error": "Error",
+}
+
+# One accent per emotional state so the stage, name chip and floating avatar
+# all agree on what Himari is doing.
+STATE_COLORS = {
+    "idle": "#b79cf5",
+    "listening": "#8fd8ff",
+    "thinking": "#b79cf5",
+    "speaking": "#ff9ad5",
+    "searching": "#8fd8ff",
+    "working": "#ffbf8a",
+    "happy": "#ffd48a",
+    "confused": "#c9a6ff",
+    "success": "#7fe3b0",
+    "sad": "#8fa7d9",
+    "error": "#ff8f9c",
 }
 
 
@@ -53,6 +74,13 @@ class AvatarWidget(QLabel):
         self._restore_blink.timeout.connect(self._restore_idle_frame)
         self._accent = None
         self._accent_animation = None
+        self._breath = 0.0
+        self._breath_timer = QTimer(self)
+        self._breath_timer.setInterval(60)
+        self._breath_timer.timeout.connect(self._breathe)
+        self._motion = not reduced_motion_enabled()
+        if self._motion:
+            self._breath_timer.start()
         self.set_state("idle")
 
     @property
@@ -64,7 +92,18 @@ class AvatarWidget(QLabel):
         if normalized not in _STATES:
             normalized = "idle"
         self._state = normalized
+        if self._accent_animation is not None:
+            try:
+                self._accent_animation.stop()
+            except RuntimeError:
+                pass
+            self._accent_animation = None
+        self._accent = QColor(STATE_COLORS.get(normalized, STATE_COLORS["idle"]))
         self._frames = self._find_frames(normalized)
+        if not self._frames and normalized != "idle":
+            # A state without dedicated art (for example "searching") should
+            # still show Himari instead of the "art not installed" placeholder.
+            self._frames = self._find_frames("thinking") or self._find_frames("idle")
         self._frame_index = 0
         self._animation.stop()
         self._restore_blink.stop()
@@ -140,6 +179,22 @@ class AvatarWidget(QLabel):
         if self._state == "idle":
             self._display_frame()
 
+    def _breathe(self):
+        if not self._motion:
+            return
+        self._breath = (self._breath + 0.055) % 6.28318
+        if self._pixmap is not None:
+            self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._motion:
+            self._breath_timer.start()
+
+    def hideEvent(self, event):
+        self._breath_timer.stop()
+        super().hideEvent(event)
+
     def set_accent(self, color):
         """Blend a soft state-colored ring around the sprite."""
         target = QColor(color) if not isinstance(color, QColor) else QColor(color)
@@ -168,6 +223,8 @@ class AvatarWidget(QLabel):
         self.update()
 
     def paintEvent(self, event):
+        if self._pixmap is not None and isinstance(self._accent, QColor):
+            self._paint_aura()
         super().paintEvent(event)
         if not isinstance(self._accent, QColor) or self._pixmap is None:
             return
@@ -182,6 +239,25 @@ class AvatarWidget(QLabel):
         ring.setAlpha(120)
         painter.setPen(QPen(ring, 2))
         painter.drawRoundedRect(rect, 20, 20)
+
+    def _paint_aura(self):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        center = QPointF(self.width() / 2.0, self.height() / 2.0)
+        breath = 0.5 + 0.5 * math.sin(self._breath)
+        radius = min(self.width(), self.height()) * 0.52 + 6.0 * breath
+        gradient = QRadialGradient(center, radius)
+        inner = QColor(self._accent)
+        inner.setAlpha(int(30 + 22 * breath))
+        middle = QColor(self._accent)
+        middle.setAlpha(int(12 + 10 * breath))
+        gradient.setColorAt(0.0, inner)
+        gradient.setColorAt(0.62, middle)
+        gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(gradient)
+        painter.drawEllipse(center, radius, radius)
+        painter.end()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -214,12 +290,30 @@ class FloatingAvatarWindow(QWidget):
         self.setWindowTitle("Himari")
         self.resize(300, 430)
         self.avatar = AvatarWidget(self, asset_dirs=asset_dirs)
+        self.avatar.setToolTip("Drag to move · click Himari to return to the app")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setContentsMargins(8, 8, 8, 10)
         layout.addWidget(self.avatar)
+        self.state_label = QLabel("Idle", self)
+        self.state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.state_label.setStyleSheet(
+            "QLabel { color: #b79cf5; background-color: rgba(18,12,29,190);"
+            " border: 1px solid rgba(183,156,245,110); border-radius: 11px;"
+            " padding: 4px 14px; font-size: 11px; font-weight: 700; }"
+        )
+        layout.addWidget(self.state_label, 0, Qt.AlignmentFlag.AlignHCenter)
 
     def set_state(self, state):
         self.avatar.set_state(state)
+        name = _STATES.get(self.avatar.state, "Idle")
+        color = QColor(STATE_COLORS.get(self.avatar.state, STATE_COLORS["idle"]))
+        self.state_label.setText(name)
+        self.state_label.setStyleSheet(
+            f"QLabel {{ color: {color.name()}; background-color: rgba(18,12,29,190);"
+            f" border: 1px solid rgba({color.red()},{color.green()},{color.blue()},120);"
+            " border-radius: 11px; padding: 4px 14px; font-size: 11px;"
+            " font-weight: 700; }"
+        )
 
     def set_avatar_size(self, width, height):
         self.resize(max(96, int(width)), max(112, int(height)))

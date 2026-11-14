@@ -12,8 +12,10 @@ from .errors import AmbiguousAppError, AppNotFoundError, WindowsEnvironmentError
 from .input import ScreenInputError, click_at, press_keys, scroll_screen, type_text
 from .launch import close_app, launch_app
 from .processes import ProcessInfo, running_processes
+from . import media_session
 from .uia import (
     ScreenControlError,
+    activate_control,
     click_control,
     focus_window as focus_window_uia,
     list_controls,
@@ -43,6 +45,8 @@ __all__ = [
     "scroll_screen",
     "list_controls",
     "click_control",
+    "activate_control",
     "set_control_text",
     "focus_window_uia",
+    "media_session",
 ]

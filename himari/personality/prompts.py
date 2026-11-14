@@ -14,8 +14,9 @@ TECHNICAL_ADDENDUM = (
 )
 
 CONVERSATION_ADDENDUM = (
-    "This is a casual conversation. Be warm and natural, keep answers short, "
-    "and do not perform a character or repeat catchphrases."
+    "This is a casual conversation. Be cozy, warm, and natural, keep answers "
+    "short, and let your personality show without performing or repeating "
+    "catchphrases."
 )
 
 

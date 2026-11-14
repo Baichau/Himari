@@ -121,6 +121,43 @@ def test_find_video_returns_watch_urls_without_opening(monkeypatch):
     assert "open only that watch URL" in result
 
 
+def test_open_video_opens_exactly_one_watch_url(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    opened = []
+    monkeypatch.setattr(
+        tools,
+        "open_url",
+        lambda url: opened.append(url) or f"Opened {url}",
+    )
+    monkeypatch.setattr(youtube, "search_videos", lambda query, limit: ([
+        {
+            "title": "10 Hours Fireplace",
+            "url": "https://www.youtube.com/watch?v=abc123DEF45",
+            "channel": "Cozy Sounds",
+            "duration": "10:00:00",
+        }
+    ][:limit], None))
+
+    result = tools.open_video("fireplace video")
+
+    assert opened == ["https://www.youtube.com/watch?v=abc123DEF45"]
+    assert "Opened video 1" in result
+    assert "not verified" in result
+
+
+def test_open_video_reports_a_missing_index(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    monkeypatch.setattr(youtube, "search_videos", lambda query, limit: ([], None))
+
+    assert "does not exist" in tools.open_video("fireplace video", index=2)
+
+
+def test_open_video_requires_permission(monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: False)
+
+    assert "disabled in Settings" in tools.open_video("fireplace video")
+
+
 def test_find_video_requires_web_research_permission(monkeypatch):
     monkeypatch.setattr(tools, "_perm", lambda name: False)
 

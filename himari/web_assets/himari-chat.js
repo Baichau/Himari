@@ -103,9 +103,31 @@
     });
   }
 
+  var pinned = true;
+
   function nearBottom() {
     return window.innerHeight + window.scrollY >=
       document.documentElement.scrollHeight - 90;
+  }
+
+  function pinOnUserInput() {
+    pinned = false;
+  }
+  window.addEventListener("wheel", pinOnUserInput, { passive: true });
+  window.addEventListener("touchstart", pinOnUserInput, { passive: true });
+  window.addEventListener("keydown", function (event) {
+    if (event.key === "ArrowUp" || event.key === "PageUp" ||
+        event.key === "Home" || event.key === " ") {
+      pinned = false;
+    }
+  });
+  if (window.ResizeObserver) {
+    var transcript = document.getElementById("transcript");
+    if (transcript) {
+      new ResizeObserver(function () {
+        if (pinned) window.scrollTo(0, document.documentElement.scrollHeight);
+      }).observe(transcript);
+    }
   }
 
   // ---- Code blocks and copying -------------------------------------------
@@ -452,8 +474,12 @@
   }
 
   function scrollBottom(smooth) {
+    pinned = true;
     var top = document.documentElement.scrollHeight;
-    if (smooth) {
+    var distance = Math.abs(top - window.scrollY);
+    // A long smooth scroll leaves the embedded view unpainted mid-animation,
+    // which reads as an empty transcript. Jump instantly for big distances.
+    if (smooth && distance < 600) {
       try {
         window.scrollTo({ top: top, behavior: "smooth" });
         return;
@@ -462,6 +488,9 @@
       }
     }
     window.scrollTo(0, top);
+    window.requestAnimationFrame(function () {
+      window.scrollTo(0, document.documentElement.scrollHeight);
+    });
   }
 
   function onWelcomeClick(event) {

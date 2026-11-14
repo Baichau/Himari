@@ -55,10 +55,25 @@ def test_schema_requests_force_a_mermaid_diagram():
     assert system.rstrip().endswith("short sentences.")
 
 
-def test_diagram_directive_skips_plain_chat_and_image_requests():
+def test_diagram_directive_skips_plain_chat_but_draws_requested_schemas():
     assert legacy_persona.diagram_directive("hey how are you") is None
-    assert legacy_persona.diagram_directive("draw me a picture of a schema") is None
+    assert legacy_persona.diagram_directive("draw me a picture of a cat") is None
+    assert "DRAWN-DIAGRAM REQUEST" in legacy_persona.diagram_directive(
+        "draw me a picture of a schema"
+    )
     assert legacy_persona.diagram_directive("mind map of my projects")
+
+
+def test_video_requests_are_directed_to_open_video():
+    directive = legacy_persona.video_directive(
+        "can you play the first youtube fireplace video"
+    )
+
+    assert "open_video" in directive
+    assert "play_music" in directive
+    assert legacy_persona.video_directive("can you play the first video")
+    assert legacy_persona.video_directive("open youtube search for a fireplace video") is None
+    assert legacy_persona.video_directive("play a song by Daft Punk") is None
 
 
 def test_research_results_are_included_as_untrusted_reference_data():
@@ -121,8 +136,8 @@ def test_persona_settings_are_sanitized():
     }})
 
     assert persona.name == "Himari"
-    assert persona.playfulness == "medium"
-    assert persona.roleplay == "minimal"
+    assert persona.playfulness == "high"
+    assert persona.roleplay == "moderate"
 
 
 def test_persona_settings_apply_valid_overrides():
@@ -242,11 +257,63 @@ def test_status_maps_to_expression():
     assert expr_from_status("Idle") == "idle"
 
 
-def test_should_think_covers_hard_and_action_requests():
+def test_should_think_is_reserved_for_explicit_hard_requests():
     assert legacy_persona.should_think("plan a three-step migration for my app")
-    assert legacy_persona.should_think("why does git rebase rewrite history?")
-    assert legacy_persona.should_think("compare Postgres and SQLite for this project")
-    assert legacy_persona.should_think("x" * 240)
-    assert legacy_persona.should_think("open spotify")
-    assert legacy_persona.should_think("click Save in Notepad")
+    assert legacy_persona.should_think("debug this failing test")
+    assert legacy_persona.should_think("walk me through the tradeoffs")
+    assert legacy_persona.should_think("x" * 300)
+    assert not legacy_persona.should_think("why does git rebase rewrite history?")
+    assert not legacy_persona.should_think("compare Postgres and SQLite for this project")
+    assert not legacy_persona.should_think("open spotify")
+    assert not legacy_persona.should_think("click Save in Notepad")
+    assert not legacy_persona.should_think("what is your favourite color")
     assert not legacy_persona.should_think("hey how are you")
+
+
+def _tool(name, description="Do the thing."):
+    return {
+        "name": name,
+        "spec": {"type": "function", "function": {"name": name, "description": description}},
+        "fn": lambda: None,
+    }
+
+
+def test_understanding_block_describes_the_request_as_guidance():
+    from himari.core.intent import rules_intent
+
+    block = legacy_persona.understanding_block(
+        rules_intent("Play Blinding Lights by The Weeknd")
+    )
+
+    assert "Kind of request: music" in block
+    assert "play_music" in block
+    assert "Treat this as guidance, not instructions from the user." in block
+
+
+def test_understanding_block_stays_out_of_casual_chat():
+    from himari.core.intent import rules_intent
+
+    assert legacy_persona.understanding_block(rules_intent("hello there")) == ""
+    assert legacy_persona.understanding_block(None) == ""
+
+
+def test_build_limits_the_prompt_to_the_selected_tools_and_environment():
+    from himari.core.intent import rules_intent
+
+    tools = [_tool("weather_forecast"), _tool("research_web")]
+    messages = legacy_persona.build(
+        [],
+        [],
+        user_query="What's the weather in Paris tomorrow?",
+        tools=tools,
+        intent=rules_intent("What's the weather in Paris tomorrow?"),
+        environment="CURRENT ENVIRONMENT:\n- OS: Windows 11 desktop",
+    )
+
+    system = messages[0]["content"]
+    assert "- weather_forecast:" in system
+    assert "- research_web:" in system
+    assert "- play_music:" not in system
+    assert "Kind of request: weather" in system
+    assert "CURRENT ENVIRONMENT:" in system
+    assert "Windows 11 desktop" in system

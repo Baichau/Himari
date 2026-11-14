@@ -232,6 +232,13 @@ def test_summarizer_uses_local_client_and_saves(memory_db):
     assert db.summary_for_session("session") == "The user prefers Russian."
 
 
+def test_summary_prompt_asks_for_decisions_and_open_tasks(memory_db):
+    assert "decisions" in summarizer.SUMMARY_PROMPT
+    assert "still open" in summarizer.SUMMARY_PROMPT
+    assert "promises" in summarizer.SUMMARY_PROMPT
+    assert "never invent" in summarizer.SUMMARY_PROMPT
+
+
 def test_summarizer_fails_soft_without_fabricating(memory_db):
     db.add_message("session", "user", "hello")
     db.add_message("session", "assistant", "hi")
@@ -252,6 +259,7 @@ def test_categories_are_stable():
         "decisions",
         "workflows",
         "conversation_summaries",
+        "activity",
     )
 
 def test_summarize_older_covers_everything_but_recent_turns(memory_db):

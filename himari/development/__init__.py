@@ -11,12 +11,20 @@ from .launcher import (
     safe_folder_name,
 )
 from .test_runner import run_tests, validate_command
-from .workspace import WorkspaceError, discover_workspaces, workspace_for
+from .workspace import (
+    WorkspaceError,
+    active_project,
+    discover_workspaces,
+    set_active_project,
+    workspace_for,
+)
 
 __all__ = [
     "WorkspaceError",
     "ChangeRejectedError",
     "EditorNotFoundError",
+    "active_project",
+    "set_active_project",
     "discover_workspaces",
     "workspace_for",
     "read_source",

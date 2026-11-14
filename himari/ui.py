@@ -5,13 +5,22 @@ from PIL import Image
 from PySide6.QtWidgets import (QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QTextEdit,
  QLineEdit,QPushButton,QLabel,QListWidget,QListWidgetItem,QCheckBox,QComboBox,QSlider,QTabWidget,
  QInputDialog,QFileDialog,QMessageBox,QSystemTrayIcon,QMenu,QScrollArea,QFrame,QSizePolicy,
- QSpinBox)
+ QSpinBox,QTreeWidget,QTreeWidgetItem,QHeaderView)
 from PySide6.QtCore import Qt, Signal, QTimer, QUrl
-from PySide6.QtGui import QFont, QIcon, QPixmap, QPainter, QDesktopServices
+from PySide6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QDesktopServices
 from .config import load, save
 from .paths import user_data_dir
 from . import db, persona, chat_web, theme, ui_effects, ui_settings
+from .ambient import AmbientBackground, AuroraDivider, reduced_motion_enabled
+from .ui_living import StatusDot, VoiceWaveform
 from .agent import AgentOrchestrator, CancellationToken
+from .core.capabilities import (
+    is_himari_browser_tool,
+    registry as capability_registry,
+    wants_himari_browser,
+)
+from .core.context import EnvironmentContext
+from .core.intent import IntentEngine
 from .control import dashboard as control_dashboard
 from .control import diagnostics as control_diagnostics
 from .control import settings as control_settings
@@ -38,7 +47,70 @@ from .attachments import (
 )
 from .vision import VisionError, describe_images
 from .tools import TOOLS
+from .tool_results import as_text
 log=logging.getLogger("himari.ui")
+
+# Requests where the right tools cannot be predicted from the category alone
+# keep the full toolbox; specialized intents get a focused, small tool list.
+GENERAL_INTENTS = frozenset(
+    {"chat", "app_control", "system", "screen", "file", "development", "deep_work"}
+)
+
+AGENT_STATUS_LABELS = {
+    "understanding": "Understanding the request",
+    "planning": "Planning the steps",
+    "waiting_for_permission": "Waiting for your permission",
+    "executing": "Using a tool",
+    "observing": "Checking what happened",
+    "verifying": "Verifying the result",
+    "recovering": "Trying a safer alternative",
+    "waiting_for_user": "Needs one detail from you",
+    "completed": "Completed",
+    "partially_completed": "Partly completed",
+    "failed": "Failed",
+    "cancelled": "Cancelled",
+}
+
+AGENT_STATUS_AVATARS = {
+    "completed": "Happy",
+    "partially_completed": "Confused",
+    "failed": "Error",
+    "cancelled": "Idle",
+    "waiting_for_permission": "Listening",
+    "waiting_for_user": "Listening",
+    "recovering": "Confused",
+}
+
+STEP_STATUS_LABELS = {
+    "pending": "pending",
+    "running": "running",
+    "succeeded": "done",
+    "failed": "failed",
+    "denied": "denied",
+    "invalid": "invalid",
+    "skipped": "skipped",
+}
+
+
+def tools_for_intent(intent):
+    """Return the tool entries that fit this turn without losing general tools."""
+    if intent is None or getattr(intent, "category", "chat") in GENERAL_INTENTS:
+        return [tool for tool in TOOLS if _tool_allowed_for_intent(tool, intent)]
+    try:
+        selected = capability_registry().select(intent)
+    except Exception as exc:
+        log.warning("Capability selection failed: %s", exc)
+        return [tool for tool in TOOLS if _tool_allowed_for_intent(tool, intent)]
+    return selected or [tool for tool in TOOLS if _tool_allowed_for_intent(tool, intent)]
+
+
+def _tool_allowed_for_intent(tool, intent):
+    """Keep Himari's isolated browser opt-in; the default browser stays the default."""
+    name = tool.get("name") if isinstance(tool, dict) else getattr(tool, "name", "")
+    if not is_himari_browser_tool(name):
+        return True
+    required = getattr(intent, "required_capabilities", []) or []
+    return wants_himari_browser(intent) or name in required
 
 
 def app_icon():
@@ -65,6 +137,7 @@ class UI(QMainWindow):
     auto_stop_requested=Signal(); wake_word_detected_signal=Signal(str)
     dashboard_ready=Signal(object); diagnostics_ready=Signal(object)
     agent_status=Signal(object); agent_finished=Signal(object)
+    coach_ready=Signal(str); doctor_ready=Signal(str); watch_changed=Signal(object)
     def __init__(self):
         super().__init__(); self.setWindowTitle("Himari ひまり"); self.resize(1160,780)
         self.setMinimumSize(980,620)
@@ -77,6 +150,10 @@ class UI(QMainWindow):
         self.setWindowIcon(app_icon())
         self.assistant_name = str((cfg.get("personality") or {}).get("name") or "Himari")
         self.session="default"
+        try:
+            db.approve_legacy_suggestions()
+        except Exception:
+            log.exception("Could not migrate legacy memory suggestions")
         self._messages=[]
         self._stream_message=None
         self._last_user_text=""
@@ -89,14 +166,17 @@ class UI(QMainWindow):
         self._render_timer.setInterval(70); self._render_timer.timeout.connect(self._render_chat)
         self._wait_timer=QTimer(self); self._wait_timer.setInterval(1000)
         self._wait_timer.timeout.connect(self._wait_tick)
+        self._tts_active=False
+        self._voice_timer=QTimer(self); self._voice_timer.setInterval(80)
+        self._voice_timer.timeout.connect(self._poll_voice)
         self._first_token_seen=True
         self._wait_started=0.0
         self._waiting_label="Waiting for Ollama…"
         self.security=SecurityLayer(confirm_callback=self._confirm_security_action)
         self.llm=LLM(TOOLS, security=self.security)
         self.tts=TTS(
-            on_error=lambda message:self.status.emit(f"TTS error: {message}"),
-            on_finished=lambda:self.status.emit("Ready."),
+            on_error=self._on_tts_error,
+            on_finished=self._on_tts_finished,
         )
         self.mic=Mic(); self.stt=None; self.busy=False
         self.hotkey_id=None; self.screen_hotkey_id=None
@@ -118,6 +198,7 @@ class UI(QMainWindow):
         )
         self.wake_word_status = QLabel("Wake-word: idle")
         self.floating_avatar = FloatingAvatarWindow(self)
+        self.floating_avatar.avatar.clicked.connect(self._restore_from_floating)
         self.tray=None
         self.capture_tray_action=None
         self._allow_quit = False
@@ -136,93 +217,176 @@ class UI(QMainWindow):
         self.ollama_checked.connect(self._apply_ollama_status)
         self.dashboard_ready.connect(self._apply_dashboard)
         self.diagnostics_ready.connect(self._apply_diagnostics)
+        self.coach_ready.connect(self._apply_coach)
+        self.doctor_ready.connect(self._apply_doctor)
+        self.watch_changed.connect(self._apply_watch_status)
         self.agent_status.connect(self._agent_progress)
         self.agent_finished.connect(self._agent_done)
-        self.tabs=ui_effects.AnimatedTabWidget(); tabs=self.tabs; self.setCentralWidget(tabs)
+        self.tabs=ui_effects.AnimatedTabWidget(); tabs=self.tabs
+        tabs.tabBar().hide()
+        self.backdrop=AmbientBackground(self._colors, self)
+        shell=QVBoxLayout(self.backdrop)
+        shell.setContentsMargins(0,0,0,0); shell.setSpacing(0)
+        body=QWidget(); body_row=QHBoxLayout(body)
+        body_row.setContentsMargins(16,10,16,16); body_row.setSpacing(16)
+        shell.addWidget(body)
+        self.setCentralWidget(self.backdrop)
         # Chat tab
         chat=QWidget(); root=QHBoxLayout(chat)
-        root.setContentsMargins(14,14,14,14); root.setSpacing(14)
+        root.setContentsMargins(0,0,0,0); root.setSpacing(0)
 
-        sidebar=QFrame(); sidebar.setObjectName("Sidebar"); sidebar.setFixedWidth(238)
-        side=QVBoxLayout(sidebar); side.setContentsMargins(12,12,12,12); side.setSpacing(8)
+        sidebar=QFrame(); sidebar.setObjectName("NavSidebar"); sidebar.setFixedWidth(248)
+        side=QVBoxLayout(sidebar); side.setContentsMargins(16,18,16,16); side.setSpacing(9)
+        brand_row=QHBoxLayout(); brand_row.setSpacing(8)
         side_brand=QLabel("Himari"); side_brand.setObjectName("AppTitle")
-        side_caption=QLabel("Local chats"); side_caption.setObjectName("MutedLine")
-        self.new_chat_btn=QPushButton("+ New chat"); self.new_chat_btn.setObjectName("PrimaryButton")
+        side_glyph=QLabel("ひまり"); side_glyph.setObjectName("Tagline")
+        brand_row.addWidget(side_brand); brand_row.addWidget(side_glyph); brand_row.addStretch()
+        side_caption=QLabel("Living anime companion"); side_caption.setObjectName("MutedLine")
+
+        status_card=QFrame(); status_card.setObjectName("GlassCard")
+        status_layout=QVBoxLayout(status_card)
+        status_layout.setContentsMargins(12,10,12,11); status_layout.setSpacing(6)
+        status_head=QHBoxLayout(); status_head.setSpacing(8)
+        self.status_dot=StatusDot(self._colors["accent"])
+        self.avatar_state=QLabel("● Idle"); self.avatar_state.setObjectName("StatusChip")
+        status_head.addWidget(self.status_dot)
+        status_head.addWidget(self.avatar_state, 1)
+        self.companion_note=QLabel("Here whenever you need me.")
+        self.companion_note.setObjectName("MutedLine")
+        self.companion_note.setWordWrap(True)
+        status_layout.addLayout(status_head); status_layout.addWidget(self.companion_note)
+
+        self.new_chat_btn=QPushButton("＋  New chat"); self.new_chat_btn.setObjectName("PrimaryButton")
+        self.new_chat_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.new_chat_btn.clicked.connect(self.new_chat)
-        side_title=QLabel("RECENT"); side_title.setObjectName("SidebarTitle")
+        side_title=QLabel("RECENT CHATS"); side_title.setObjectName("SidebarTitle")
         self.session_list=QListWidget(); self.session_list.setObjectName("SessionList")
         self.session_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.session_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.session_list.customContextMenuRequested.connect(self._session_menu)
         self.session_list.itemClicked.connect(self._session_changed)
         self.session_list.itemActivated.connect(self._session_changed)
-        side.addWidget(side_brand); side.addWidget(side_caption)
-        side.addWidget(self.new_chat_btn); side.addSpacing(4)
+
+        side.addLayout(brand_row); side.addWidget(side_caption)
+        side.addSpacing(2); side.addWidget(status_card)
+        self.watch_card=QFrame(); self.watch_card.setObjectName("GlassCard")
+        watch_layout=QHBoxLayout(self.watch_card)
+        watch_layout.setContentsMargins(10,7,8,7); watch_layout.setSpacing(6)
+        self.watch_dot=StatusDot("#ff6b9d")
+        self.watch_badge=QLabel("Watching"); self.watch_badge.setObjectName("StatusChip")
+        self.watch_left=QLabel("")
+        self.watch_left.setObjectName("MutedLine")
+        self.watch_stop_btn=QPushButton("Stop"); self.watch_stop_btn.setObjectName("SoftButton")
+        self.watch_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.watch_stop_btn.clicked.connect(self.stop_watch)
+        watch_layout.addWidget(self.watch_dot)
+        watch_layout.addWidget(self.watch_badge)
+        watch_layout.addWidget(self.watch_left,1)
+        watch_layout.addWidget(self.watch_stop_btn)
+        self.watch_card.setVisible(False)
+        side.addWidget(self.watch_card)
+        side.addWidget(self.new_chat_btn); side.addSpacing(2)
         side.addWidget(side_title); side.addWidget(self.session_list, 1)
         side_hint=QLabel("Right-click a chat to delete it")
         side_hint.setObjectName("MutedLine"); side_hint.setWordWrap(True)
         side.addWidget(side_hint)
+        explore_title=QLabel("EXPLORE"); explore_title.setObjectName("SidebarTitle")
+        side.addWidget(explore_title)
+        self._nav_buttons={}
+        for label, index in (
+            ("Chat", 0), ("Companion", 1), ("Dashboard", 2), ("Tasks", 3),
+            ("Activity", 4), ("Memory", 5), ("Settings", 6), ("Diagnostics", 7),
+        ):
+            button=QPushButton(label); button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, i=index: self.tabs.setCurrentIndex(i))
+            self._nav_buttons[index]=button
+            side.addWidget(button)
         side_privacy=QLabel("Private · stored only on this PC")
         side_privacy.setObjectName("MutedLine"); side_privacy.setWordWrap(True)
         side.addWidget(side_privacy)
-        root.addWidget(sidebar)
+        body_row.addWidget(sidebar)
+        body_row.addWidget(tabs, 1)
 
         main=QVBoxLayout(); main.setSpacing(10)
-        header_card=QFrame(); header_card.setObjectName("HeaderCard")
-        header=QHBoxLayout(header_card); header.setContentsMargins(14,12,14,12); header.setSpacing(16)
-        self.avatar=AvatarWidget(self); self.avatar.setFixedSize(104,168)
+        hero=QFrame(); hero.setObjectName("HeroCard")
+        hero_row=QHBoxLayout(hero); hero_row.setContentsMargins(18,14,18,14); hero_row.setSpacing(18)
+        stage=QFrame(); stage.setObjectName("AvatarStage")
+        stage.setFixedSize(176,230)
+        stage_layout=QVBoxLayout(stage); stage_layout.setContentsMargins(10,10,10,10)
+        self.avatar=AvatarWidget(self); self.avatar.setFixedSize(152,208)
         self.avatar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.avatar.clicked.connect(self.toggle_floating_avatar)
-        title=QVBoxLayout(); title.setSpacing(4)
-        name=QLabel("Himari ひまり"); name.setObjectName("AppTitle")
-        name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tagline=QLabel("Warm, local companion — nothing leaves your PC")
-        tagline.setObjectName("Tagline")
-        tagline.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.avatar_state = QLabel("● Idle"); self.avatar_state.setObjectName("StatusChip")
-        self.avatar_state.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-        title.addWidget(name); title.addWidget(tagline); title.addWidget(self.avatar_state)
-        title.addStretch()
-        header.addWidget(
-            self.avatar, 0,
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        stage_layout.addWidget(self.avatar, 0, Qt.AlignmentFlag.AlignCenter)
+        hero_row.addWidget(stage, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        info=QVBoxLayout(); info.setSpacing(7)
+        name_row=QHBoxLayout(); name_row.setSpacing(10)
+        name=QLabel("Himari"); name.setObjectName("HeroName")
+        glyph=QLabel("ひまり"); glyph.setObjectName("Tagline")
+        name_row.addWidget(name); name_row.addWidget(glyph)
+        name_row.addStretch()
+        self.mood_label=QLabel("Idle · dreaming of new chats")
+        self.mood_label.setObjectName("HeroMood")
+        tagline=QLabel(
+            "Warm, local companion — she listens, remembers, and gets things done on this PC."
         )
-        header.addLayout(title, 1)
+        tagline.setObjectName("Tagline")
+        tagline.setWordWrap(True)
+        stats_row=QHBoxLayout(); stats_row.setSpacing(6)
+        for text in ("● Fully local", "● Private memory", "● Voice ready"):
+            chip=QLabel(text); chip.setObjectName("MutedLine")
+            chip.setStyleSheet(
+                f"color: {self._colors['muted']}; background-color: {self._colors['card']};"
+                f" border: 1px solid {self._colors['border']}; border-radius: 10px;"
+                " padding: 4px 9px; font-size: 10px;"
+            )
+            stats_row.addWidget(chip)
+        stats_row.addStretch()
         actions_widget=QWidget()
         actions_widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
-        header_actions=QVBoxLayout(actions_widget)
-        header_actions.setContentsMargins(0,0,0,0); header_actions.setSpacing(6)
+        header_actions=QHBoxLayout(actions_widget)
+        header_actions.setContentsMargins(0,0,0,0); header_actions.setSpacing(8)
         self.voice_btn=QPushButton(); self.voice_btn.setCheckable(True)
+        self.voice_btn.setObjectName("IconButton")
         self.voice_btn.setChecked(self._voice_replies())
         self.voice_btn.setToolTip("Speak replies aloud using the local Piper voice")
         self.voice_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.voice_btn.toggled.connect(self._toggle_voice_replies)
         self._update_voice_button(self.voice_btn.isChecked())
-        self.floating_avatar_btn=QPushButton("Float avatar")
+        self.floating_avatar_btn=QPushButton("↗ Float")
+        self.floating_avatar_btn.setObjectName("IconButton")
+        self.floating_avatar_btn.setToolTip("Keep Himari on top of other windows")
         self.floating_avatar_btn.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
         self.floating_avatar_btn.clicked.connect(self.toggle_floating_avatar)
         header_actions.addWidget(self.voice_btn)
         header_actions.addWidget(self.floating_avatar_btn)
-        header_actions.addStretch()
-        header.addWidget(
-            actions_widget, 0,
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-        )
-        main.addWidget(header_card)
+        info.addLayout(name_row); info.addWidget(self.mood_label); info.addWidget(tagline)
+        info.addLayout(stats_row)
+        info.addLayout(header_actions)
+        hero_row.addLayout(info, 1)
+        main.addWidget(hero)
 
         toolbar=QHBoxLayout(); toolbar.setSpacing(8)
-        self.mic_btn=QPushButton(self._talk_label()); self.mic_btn.clicked.connect(self.toggle_mic)
-        self.stop_btn=QPushButton("Stop voice"); self.stop_btn.clicked.connect(self.tts.stop)
+        self.mic_btn=QPushButton(self._talk_label()); self.mic_btn.setObjectName("ChipButton")
+        self.mic_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mic_btn.clicked.connect(self.toggle_mic)
+        self.stop_btn=QPushButton("Stop voice"); self.stop_btn.setObjectName("ChipButton")
+        self.stop_btn.clicked.connect(self._stop_voice)
         screen_key = str(load().get("screen", {}).get("capture_hotkey", "f10") or "").upper()
         self.analyze_btn=QPushButton(f"Screen ({screen_key})" if screen_key else "Screen")
+        self.analyze_btn.setObjectName("ChipButton")
+        self.analyze_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.analyze_btn.clicked.connect(self.screen_query)
-        self.show_tools_btn=QPushButton("Tools"); self.show_tools_btn.setCheckable(True)
+        self.show_tools_btn=QPushButton("Tool trace"); self.show_tools_btn.setCheckable(True)
+        self.show_tools_btn.setObjectName("ChipButton")
         self.show_tools_btn.setToolTip("Show tool calls in the transcript")
         self.show_tools_btn.toggled.connect(lambda _: self._render_chat(force_scroll=True))
-        self.save_memory_btn=QPushButton("Save memory")
+        self.save_memory_btn=QPushButton("Save memory"); self.save_memory_btn.setObjectName("ChipButton")
         self.save_memory_btn.setToolTip("Save selected chat text (or a new note) as a long-term memory")
         self.save_memory_btn.clicked.connect(self.save_chat_memory)
-        self.clear_btn=QPushButton("Delete chat")
+        self.clear_btn=QPushButton("Delete chat"); self.clear_btn.setObjectName("ChipButton")
         self.clear_btn.setToolTip("Delete this conversation from local history; saved memories are kept")
         self.clear_btn.clicked.connect(self.clear_chat)
         toolbar.addWidget(self.mic_btn); toolbar.addWidget(self.stop_btn)
@@ -246,9 +410,15 @@ class UI(QMainWindow):
         )
         main.addWidget(self.chat, 1)
 
+        voice_row=QHBoxLayout(); voice_row.setSpacing(12)
+        self.voice_wave=VoiceWaveform(self._colors)
+        self.voice_wave.setToolTip("Real microphone and voice activity")
+        voice_row.addWidget(self.voice_wave, 1)
         self.status_label=QLabel("Starting…"); self.status_label.setObjectName("StatusLine")
+        voice_row.addWidget(self.status_label)
+        main.addLayout(voice_row)
         self.wake_word_status.setObjectName("MutedLine")
-        main.addWidget(self.status_label); main.addWidget(self.wake_word_status)
+        main.addWidget(self.wake_word_status)
 
         self.attachments_widget=QWidget()
         self.attachments_row=QHBoxLayout(self.attachments_widget)
@@ -256,29 +426,37 @@ class UI(QMainWindow):
         self.attachments_widget.setVisible(False)
         main.addWidget(self.attachments_widget)
 
-        row2=QHBoxLayout(); row2.setSpacing(8)
-        self.attach_btn=QPushButton("Attach")
+        composer=QFrame(); composer.setObjectName("ComposerFrame")
+        composer_row=QHBoxLayout(composer)
+        composer_row.setContentsMargins(8,6,8,6); composer_row.setSpacing(6)
+        self.attach_btn=QPushButton("＋")
+        self.attach_btn.setObjectName("IconButton")
+        self.attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.attach_btn.setToolTip(
             "Attach images, PDF, Word, spreadsheet, or text/code files. "
             "Files stay local and are read only for this message."
         )
         self.attach_btn.clicked.connect(self.attach_files)
-        self.input=QLineEdit(); self.input.setPlaceholderText("Message Himari…  (Enter to send)")
+        self.input=QLineEdit(); self.input.setObjectName("ComposerInput")
+        self.input.setPlaceholderText("Say something to Himari…  (Enter to send)")
         self.input.returnPressed.connect(self.send)
+        self.retry_btn=QPushButton("Retry")
+        self.retry_btn.setObjectName("SoftButton")
+        self.retry_btn.setToolTip("Send the last message again without adding a duplicate")
+        self.retry_btn.clicked.connect(self.retry_last)
+        self.retry_btn.setVisible(False)
         self.send_btn=QPushButton("Send"); self.send_btn.setObjectName("PrimaryButton")
+        self.send_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send_btn.clicked.connect(self.send)
         self.stop_generation_btn=QPushButton("Stop"); self.stop_generation_btn.setObjectName("StopButton")
         self.stop_generation_btn.clicked.connect(self.stop_generation)
         self.stop_generation_btn.setVisible(False)
-        self.retry_btn=QPushButton("Retry")
-        self.retry_btn.setToolTip("Send the last message again without adding a duplicate")
-        self.retry_btn.clicked.connect(self.retry_last)
-        self.retry_btn.setVisible(False)
-        row2.addWidget(self.attach_btn)
-        row2.addWidget(self.input, 1); row2.addWidget(self.retry_btn)
-        row2.addWidget(self.send_btn)
-        row2.addWidget(self.stop_generation_btn)
-        main.addLayout(row2)
+        composer_row.addWidget(self.attach_btn)
+        composer_row.addWidget(self.input, 1)
+        composer_row.addWidget(self.retry_btn)
+        composer_row.addWidget(self.send_btn)
+        composer_row.addWidget(self.stop_generation_btn)
+        main.addWidget(composer)
         self.shortcut_hint=QLabel("")
         self.shortcut_hint.setObjectName("MutedLine")
         main.addWidget(self.shortcut_hint)
@@ -286,33 +464,240 @@ class UI(QMainWindow):
         self._refresh_send_button()
         root.addLayout(main, 1)
         tabs.addTab(chat,"Chat")
+        # Companion tab
+        companion_content=QWidget()
+        companion_layout=QVBoxLayout(companion_content)
+        companion_layout.setContentsMargins(26,18,26,26); companion_layout.setSpacing(12)
+        companion_layout.addStretch(1)
+        companion_card=QFrame(); companion_card.setObjectName("GlassCard")
+        companion_card.setMaximumWidth(780)
+        companion_body=QVBoxLayout(companion_card)
+        companion_body.setContentsMargins(30,24,30,26); companion_body.setSpacing(10)
+        companion_kicker=QLabel("COMPANION MODE")
+        companion_kicker.setObjectName("SectionLabel")
+        companion_kicker.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        companion_title=QLabel("Himari, right here")
+        companion_title.setObjectName("HeroName")
+        companion_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        companion_stage=QFrame(); companion_stage.setObjectName("AvatarStage")
+        companion_stage.setFixedSize(348,452)
+        companion_stage_layout=QVBoxLayout(companion_stage)
+        companion_stage_layout.setContentsMargins(12,12,12,12)
+        self.companion_avatar=AvatarWidget(self)
+        self.companion_avatar.setFixedSize(320,424)
+        self.companion_avatar.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        self.companion_avatar.clicked.connect(self.toggle_floating_avatar)
+        companion_stage_layout.addWidget(
+            self.companion_avatar, 0, Qt.AlignmentFlag.AlignCenter
+        )
+        companion_stage_row=QHBoxLayout()
+        companion_stage_row.addStretch()
+        companion_stage_row.addWidget(companion_stage)
+        companion_stage_row.addStretch()
+        self.companion_state=QLabel("● Idle"); self.companion_state.setObjectName("StatusChip")
+        self.companion_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.companion_state.setMaximumWidth(200)
+        companion_state_row=QHBoxLayout()
+        companion_state_row.addStretch()
+        companion_state_row.addWidget(self.companion_state)
+        companion_state_row.addStretch()
+        self.companion_mood=QLabel("Idle · dreaming of new chats")
+        self.companion_mood.setObjectName("HeroMood")
+        self.companion_mood.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.companion_wave=VoiceWaveform(self._colors, bars=34)
+        self.companion_wave.setFixedHeight(46)
+        self.companion_wave.setMaximumWidth(430)
+        companion_wave_row=QHBoxLayout()
+        companion_wave_row.addStretch()
+        companion_wave_row.addWidget(self.companion_wave, 1)
+        companion_wave_row.addStretch()
+        companion_actions=QHBoxLayout(); companion_actions.setSpacing(8)
+        companion_talk=QPushButton("Talk to Himari"); companion_talk.setObjectName("PrimaryButton")
+        companion_talk.setCursor(Qt.CursorShape.PointingHandCursor)
+        companion_talk.clicked.connect(self.toggle_mic)
+        companion_screen=QPushButton("Capture screen"); companion_screen.setObjectName("SoftButton")
+        companion_screen.clicked.connect(self.screen_query)
+        companion_float=QPushButton("Float avatar"); companion_float.setObjectName("SoftButton")
+        companion_float.clicked.connect(self.toggle_floating_avatar)
+        companion_back=QPushButton("Back to chat"); companion_back.setObjectName("SoftButton")
+        companion_back.clicked.connect(lambda: self.tabs.setCurrentIndex(0))
+        for button in (companion_talk, companion_screen, companion_float, companion_back):
+            companion_actions.addWidget(button)
+        companion_hint=QLabel(
+            "Himari only listens when you start the microphone, and every tool "
+            "still asks for your permission."
+        )
+        companion_hint.setObjectName("MutedLine")
+        companion_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        companion_hint.setWordWrap(True)
+        companion_body.addWidget(companion_kicker)
+        companion_body.addWidget(companion_title)
+        companion_body.addLayout(companion_stage_row)
+        companion_body.addLayout(companion_state_row)
+        companion_body.addWidget(self.companion_mood)
+        companion_body.addLayout(companion_wave_row)
+        companion_body.addSpacing(4)
+        companion_body.addLayout(companion_actions)
+        self.companion_watch_btn=QPushButton("Watch with me"); self.companion_watch_btn.setObjectName("SoftButton")
+        self.companion_watch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.companion_watch_btn.clicked.connect(self.toggle_watch)
+        companion_watch_row=QHBoxLayout()
+        companion_watch_row.addStretch(); companion_watch_row.addWidget(self.companion_watch_btn)
+        companion_watch_row.addStretch()
+        self.companion_watch_status=QLabel(
+            "Watch is off — she looks only while you ask, never records."
+        )
+        self.companion_watch_status.setObjectName("MutedLine")
+        self.companion_watch_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.companion_watch_status.setWordWrap(True)
+        companion_body.addLayout(companion_watch_row)
+        companion_body.addWidget(self.companion_watch_status)
+        companion_body.addWidget(companion_hint)
+        companion_card_row=QHBoxLayout()
+        companion_card_row.addStretch()
+        companion_card_row.addWidget(companion_card, 1)
+        companion_card_row.addStretch()
+        companion_layout.addLayout(companion_card_row)
+
+        coach_card=QFrame(); coach_card.setObjectName("GlassCard")
+        coach_card.setMaximumWidth(780)
+        coach_body=QVBoxLayout(coach_card)
+        coach_body.setContentsMargins(24,18,24,20); coach_body.setSpacing(8)
+        coach_kicker=QLabel("SETUP COACH")
+        coach_kicker.setObjectName("SectionLabel")
+        coach_title=QLabel("Let me walk you through a setup")
+        coach_title.setObjectName("CardTitle")
+        coach_title.setWordWrap(True)
+        coach_row=QHBoxLayout(); coach_row.setSpacing(8)
+        self.coach_topic=QComboBox()
+        for label, key in (
+            ("Spotify credentials", "spotify"),
+            ("VS Code pairing", "vscode"),
+            ("Voice and TTS", "voice"),
+            ("Ollama models", "ollama"),
+            ("Browser tools", "browser"),
+            ("Watch companion", "watch"),
+        ):
+            self.coach_topic.addItem(label, key)
+        self.coach_btn=QPushButton("Show steps"); self.coach_btn.setObjectName("SoftButton")
+        self.coach_btn.clicked.connect(self.show_coach_guide)
+        self.coach_verify_btn=QPushButton("Verify"); self.coach_verify_btn.setObjectName("SoftButton")
+        self.coach_verify_btn.clicked.connect(self.verify_coach_setup)
+        coach_row.addWidget(self.coach_topic,1)
+        coach_row.addWidget(self.coach_btn)
+        coach_row.addWidget(self.coach_verify_btn)
+        self.coach_text=QTextEdit(); self.coach_text.setReadOnly(True)
+        self.coach_text.setMaximumHeight(170)
+        self.coach_text.setPlaceholderText(
+            "Pick a topic and press Show steps. Secrets are never displayed, "
+            "only whether they are configured."
+        )
+        coach_body.addWidget(coach_kicker)
+        coach_body.addWidget(coach_title)
+        coach_body.addLayout(coach_row)
+        coach_body.addWidget(self.coach_text)
+        coach_card_row=QHBoxLayout()
+        coach_card_row.addStretch(); coach_card_row.addWidget(coach_card, 1); coach_card_row.addStretch()
+        companion_layout.addLayout(coach_card_row)
+        companion_layout.addStretch(1)
+        companion=QScrollArea(); companion.setWidgetResizable(True)
+        companion.setFrameShape(QFrame.Shape.NoFrame)
+        companion.setWidget(companion_content)
+        tabs.addTab(companion,"Companion")
         # Dashboard tab
-        dash=QWidget(); dv=QVBoxLayout(dash)
-        dash_row=QHBoxLayout()
-        refresh_dash=QPushButton("Refresh dashboard")
+        dash, dv, dash_head = self._page_shell(
+            "Dashboard",
+            "A calm overview of what Himari is doing on this PC — all local.",
+        )
+        refresh_dash=QPushButton("Refresh"); refresh_dash.setObjectName("SoftButton")
         refresh_dash.clicked.connect(self.refresh_dashboard)
-        dash_row.addWidget(refresh_dash); dash_row.addStretch()
-        dv.addLayout(dash_row)
+        dash_head.addWidget(refresh_dash, 0, Qt.AlignmentFlag.AlignTop)
+        dash_card, dash_body = self._glass_card()
         self.dashboard_text=QTextEdit(); self.dashboard_text.setReadOnly(True)
-        self.dashboard_text.setPlainText("Dashboard not loaded yet. Press Refresh dashboard.")
-        dv.addWidget(self.dashboard_text, 2)
-        self.dash_activity=QListWidget(); dv.addWidget(QLabel("Recent activity:")); dv.addWidget(self.dash_activity, 1)
+        self.dashboard_text.setObjectName("DashboardText")
+        self.dashboard_text.setPlainText("Dashboard not loaded yet. Press Refresh.")
+        dash_body.addWidget(self.dashboard_text, 2)
+        activity_label=QLabel("RECENT ACTIVITY"); activity_label.setObjectName("SectionLabel")
+        dash_body.addWidget(activity_label)
+        self.dash_activity=QListWidget(); dash_body.addWidget(self.dash_activity, 1)
+        dv.addWidget(dash_card, 1)
+        tabs.addTab(dash,"Dashboard")
+        tasks_tab, tv, tasks_head = self._page_shell(
+            "Tasks",
+            "Describe an outcome; Himari plans the steps, uses allowed tools, "
+            "checks what happened, and reports honestly.",
+        )
+        tasks_card, task_body = self._glass_card()
         task_row=QHBoxLayout()
         self.agent_input=QLineEdit()
-        self.agent_input.setPlaceholderText("Describe a task for Himari to work on…")
+        self.agent_input.setPlaceholderText("e.g. Play Blinding Lights by The Weeknd")
         self.agent_input.returnPressed.connect(self.run_agent_task)
-        self.agent_run_btn=QPushButton("Run task"); self.agent_run_btn.clicked.connect(self.run_agent_task)
-        self.agent_cancel_btn=QPushButton("Cancel task"); self.agent_cancel_btn.clicked.connect(self.cancel_agent_task)
+        self.agent_run_btn=QPushButton("Run task"); self.agent_run_btn.setObjectName("PrimaryButton")
+        self.agent_run_btn.clicked.connect(self.run_agent_task)
+        self.agent_cancel_btn=QPushButton("Cancel"); self.agent_cancel_btn.setObjectName("SoftButton")
+        self.agent_cancel_btn.clicked.connect(self.cancel_agent_task)
         self.agent_cancel_btn.setEnabled(False)
-        task_row.addWidget(self.agent_input); task_row.addWidget(self.agent_run_btn); task_row.addWidget(self.agent_cancel_btn)
-        dv.addLayout(task_row)
-        self.agent_status_label=QLabel("Agent: idle"); dv.addWidget(self.agent_status_label)
-        tabs.addTab(dash,"Dashboard")
-        activity_tab=QWidget(); activity_layout=QVBoxLayout(activity_tab)
-        self.activity_list=QListWidget(); activity_layout.addWidget(self.activity_list)
+        task_row.addWidget(self.agent_input,1); task_row.addWidget(self.agent_run_btn); task_row.addWidget(self.agent_cancel_btn)
+        task_body.addLayout(task_row)
+        task_hint=QLabel(
+            "Anything risky asks for your permission first. Denying a step stops it; "
+            "Himari never retries a denied or uncertain action on its own."
+        )
+        task_hint.setObjectName("SectionHint"); task_hint.setWordWrap(True)
+        task_body.addWidget(task_hint)
+        self.agent_status_label=QLabel("Agent: idle"); task_body.addWidget(self.agent_status_label)
+        self.agent_plan=QTreeWidget()
+        self.agent_plan.setHeaderLabels(["Step","Tool","Status","Check"])
+        self.agent_plan.setRootIsDecorated(False)
+        self.agent_plan.setAlternatingRowColors(True)
+        self.agent_plan.setUniformRowHeights(True)
+        self.agent_plan.setMinimumHeight(140)
+        header = self.agent_plan.header()
+        header.setStretchLastSection(True)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        task_body.addWidget(self.agent_plan, 3)
+        report_label=QLabel("COMPLETION REPORT"); report_label.setObjectName("SectionLabel")
+        task_body.addWidget(report_label)
+        self.agent_report=QTextEdit(); self.agent_report.setReadOnly(True)
+        self.agent_report.setPlaceholderText("The report appears here when the task ends.")
+        self.agent_report.setMaximumHeight(140)
+        task_body.addWidget(self.agent_report, 1)
+        tasks_history_row=QHBoxLayout()
+        history_label=QLabel("RECENT TASKS"); history_label.setObjectName("SectionLabel")
+        tasks_history_row.addWidget(history_label)
+        open_task_btn=QPushButton("Open selected"); open_task_btn.setObjectName("SoftButton")
+        open_task_btn.clicked.connect(self.open_selected_task)
+        tasks_history_row.addWidget(open_task_btn); tasks_history_row.addStretch()
+        task_body.addLayout(tasks_history_row)
+        self.task_history=QListWidget()
+        self.task_history.itemDoubleClicked.connect(lambda _item: self.open_selected_task())
+        task_body.addWidget(self.task_history, 1)
+        tv.addWidget(tasks_card, 1)
+        tabs.addTab(tasks_tab,"Tasks")
+        activity_tab, activity_layout, activity_head = self._page_shell(
+            "Activity",
+            "Every tool run with its real result — including actions that were "
+            "denied or never happened.",
+        )
+        activity_refresh=QPushButton("Reload"); activity_refresh.setObjectName("SoftButton")
+        activity_refresh.clicked.connect(self.refresh_actions)
+        activity_head.addWidget(activity_refresh, 0, Qt.AlignmentFlag.AlignTop)
+        activity_card, activity_body = self._glass_card()
+        self.activity_list=QListWidget(); activity_body.addWidget(self.activity_list)
+        activity_layout.addWidget(activity_card, 1)
         tabs.addTab(activity_tab,"Activity")
         # Memory tab
-        mem=QWidget(); mv=QVBoxLayout(mem)
+        mem, mv, mem_head = self._page_shell(
+            "Memory",
+            "What Himari remembers about you stays in a local database. "
+            "Facts are never saved without review.",
+        )
+        mem_card, mem_body = self._glass_card()
         search_row=QHBoxLayout()
         self.memory_search=QLineEdit()
         self.memory_search.setPlaceholderText("Search saved memories")
@@ -324,40 +709,87 @@ class UI(QMainWindow):
         self.memory_filter.currentIndexChanged.connect(self.refresh_mem)
         search_row.addWidget(self.memory_search,1)
         search_row.addWidget(self.memory_filter)
-        mv.addLayout(search_row)
-        self.mem_list=QListWidget(); mv.addWidget(self.mem_list)
+        mem_body.addLayout(search_row)
+        self.mem_list=QListWidget(); mem_body.addWidget(self.mem_list, 2)
         mrow=QHBoxLayout()
-        add=QPushButton("Add"); add.clicked.connect(self.add_mem)
-        edit=QPushButton("Edit"); edit.clicked.connect(self.edit_mem)
-        dele=QPushButton("Delete"); dele.clicked.connect(self.del_mem)
-        conflicts=QPushButton("Check contradictions")
+        add=QPushButton("Add"); add.setObjectName("SoftButton"); add.clicked.connect(self.add_mem)
+        edit=QPushButton("Edit"); edit.setObjectName("SoftButton"); edit.clicked.connect(self.edit_mem)
+        dele=QPushButton("Delete"); dele.setObjectName("SoftButton"); dele.clicked.connect(self.del_mem)
+        conflicts=QPushButton("Check contradictions"); conflicts.setObjectName("SoftButton")
         conflicts.setToolTip(
             "Look for saved memories that appear to disagree. Nothing is changed automatically."
         )
         conflicts.clicked.connect(self.check_memory_conflicts)
         for b in [add,edit,dele,conflicts]: mrow.addWidget(b)
-        mv.addLayout(mrow)
-        mv.addWidget(QLabel("Memory suggestions (review before saving):"))
-        self.suggestion_list=QListWidget(); mv.addWidget(self.suggestion_list)
+        mrow.addStretch()
+        mem_body.addLayout(mrow)
+        suggestion_label=QLabel("SUGGESTIONS — REVIEW BEFORE SAVING")
+        suggestion_label.setObjectName("SectionLabel")
+        mem_body.addWidget(suggestion_label)
+        self.suggestion_list=QListWidget(); mem_body.addWidget(self.suggestion_list, 1)
         suggestion_row=QHBoxLayout()
-        approve=QPushButton("Approve suggestion")
+        approve=QPushButton("Approve"); approve.setObjectName("PrimaryButton")
         approve.clicked.connect(self.approve_memory_suggestion)
-        reject=QPushButton("Reject suggestion")
+        reject=QPushButton("Reject"); reject.setObjectName("SoftButton")
         reject.clicked.connect(self.reject_memory_suggestion)
         suggestion_row.addWidget(approve); suggestion_row.addWidget(reject)
-        mv.addLayout(suggestion_row); self.memory_tab_index=tabs.addTab(mem,"Memory")
+        suggestion_row.addStretch()
+        mem_body.addLayout(suggestion_row)
+        mv.addWidget(mem_card, 1)
+        self.memory_tab_index=tabs.addTab(mem,"Memory")
         # Settings tab
+        settings_page, sv, settings_head = self._page_shell(
+            "Settings",
+            "Tune the voice, model, hotkeys and permissions. Everything is "
+            "stored locally on this PC.",
+        )
         settings_scroll=ui_settings.build_settings_page(self)
-        self.settings_tab_index=tabs.addTab(settings_scroll,"Settings")
-        diag=QWidget(); dv2=QVBoxLayout(diag)
-        self.diag_btn=QPushButton("Run diagnostics"); self.diag_btn.clicked.connect(self.run_diagnostics)
+        sv.addWidget(settings_scroll, 1)
+        self.settings_tab_index=tabs.addTab(settings_page,"Settings")
+        diag, dv2, diag_head = self._page_shell(
+            "Diagnostics",
+            "Check local dependencies, Ollama, the database and permissions.",
+        )
+        self.diag_btn=QPushButton("Run diagnostics"); self.diag_btn.setObjectName("PrimaryButton")
+        self.diag_btn.clicked.connect(self.run_diagnostics)
+        diag_head.addWidget(self.diag_btn, 0, Qt.AlignmentFlag.AlignTop)
+        diag_card, diag_body = self._glass_card()
         self.diag_text=QTextEdit(); self.diag_text.setReadOnly(True)
-        self.diag_text.setPlainText("Run diagnostics to check local dependencies, Ollama, the database, and permissions.")
-        dv2.addWidget(self.diag_btn); dv2.addWidget(self.diag_text)
+        self.diag_text.setPlainText(
+            "Run diagnostics to check local dependencies, Ollama, the database, "
+            "and permissions."
+        )
+        diag_body.addWidget(self.diag_text)
+        dv2.addWidget(diag_card, 1)
+        doctor_card, doctor_body = self._glass_card()
+        doctor_head=QHBoxLayout(); doctor_head.setSpacing(8)
+        doctor_title=QLabel("SYSTEM DOCTOR"); doctor_title.setObjectName("SectionLabel")
+        self.doctor_name=QLineEdit()
+        self.doctor_name.setPlaceholderText("Program or game name (optional)")
+        self.doctor_system_btn=QPushButton("Inspect system"); self.doctor_system_btn.setObjectName("SoftButton")
+        self.doctor_system_btn.clicked.connect(self.run_doctor_system)
+        self.doctor_program_btn=QPushButton("Diagnose program"); self.doctor_program_btn.setObjectName("SoftButton")
+        self.doctor_program_btn.clicked.connect(self.run_doctor_program)
+        doctor_head.addWidget(doctor_title)
+        doctor_head.addStretch()
+        doctor_head.addWidget(self.doctor_name, 1)
+        doctor_head.addWidget(self.doctor_system_btn)
+        doctor_head.addWidget(self.doctor_program_btn)
+        doctor_body.addLayout(doctor_head)
+        self.doctor_text=QTextEdit(); self.doctor_text.setReadOnly(True)
+        self.doctor_text.setPlaceholderText(
+            "Read-only: uptime, CPU, memory, disks, GPU, top processes and recent "
+            "Windows errors. Nothing is changed, terminated or uninstalled."
+        )
+        doctor_body.addWidget(self.doctor_text)
+        dv2.addWidget(doctor_card, 1)
         tabs.addTab(diag,"Diagnostics")
+        self.tabs.currentChanged.connect(self._sync_nav)
+        self._sync_nav(self.tabs.currentIndex())
         self._restore_last_session()
         self.refresh_mem()
         self.refresh_actions()
+        self.refresh_tasks()
         QTimer.singleShot(300,self.check)
         QTimer.singleShot(700,self.refresh_dashboard)
         QTimer.singleShot(2500,self._preload_model)
@@ -369,6 +801,11 @@ class UI(QMainWindow):
         self._settings_save_timer.setInterval(600)
         self._settings_save_timer.timeout.connect(self._autosave_settings)
         self._connect_settings_autosave()
+        self._watch_timer=QTimer(self)
+        self._watch_timer.setInterval(2000)
+        self._watch_timer.timeout.connect(self._poll_watch)
+        self._watch_timer.start()
+        QTimer.singleShot(400, self._poll_watch)
     # ---- chat shell -------------------------------------------------
     def _talk_label(self, key=None):
         if key is None:
@@ -577,7 +1014,7 @@ class UI(QMainWindow):
             total = db.message_count(self.session)
         except Exception:
             return
-        if total < 48 or total - self._summary_at < 24:
+        if total < 40 or total - self._summary_at < 16:
             return
         self._summary_at = total
         self._summary_running = True
@@ -585,7 +1022,7 @@ class UI(QMainWindow):
 
         def work():
             try:
-                summarize_older(session, keep_recent=32)
+                summarize_older(session, keep_recent=24)
             except Exception as exc:
                 log.warning("Conversation summarization failed: %s", exc)
             finally:
@@ -740,6 +1177,7 @@ class UI(QMainWindow):
             "Idle": ("● Idle", p["muted"]),
             "Listening": ("● Listening", p["success"]),
             "Thinking": ("● Thinking", p["warning"]),
+            "Searching": ("● Searching", p["accent_2"]),
             "Speaking": ("● Speaking", p["accent_strong"]),
             "Working": ("● Working", p["accent"]),
             "Happy": ("● Happy", p["success"]),
@@ -753,9 +1191,40 @@ class UI(QMainWindow):
             f"color: {color}; background-color: {p['card_alt']}; "
             "border-radius: 10px; padding: 4px 10px; font-weight: 600;"
         )
+        moods = {
+            "Idle": "Idle · dreaming of new chats",
+            "Listening": "Listening · go ahead, I'm here",
+            "Thinking": "Thinking · one moment…",
+            "Searching": "Searching · looking through sources",
+            "Speaking": "Speaking · out loud for you",
+            "Working": "Working · busy on this PC",
+            "Happy": "Happy · that went nicely!",
+            "Confused": "Confused · hmm, say that again?",
+            "Sad": "A little trouble · let's fix it",
+            "Error": "Something went wrong · let's fix it",
+        }
+        notes = {
+            "Idle": "Here whenever you need me.",
+            "Listening": "Listening — take your time.",
+            "Thinking": "Thinking it through…",
+            "Searching": "Looking through the web or your project.",
+            "Speaking": "Reading my reply out loud.",
+            "Working": "Running a task on this PC.",
+            "Happy": "That worked out nicely.",
+            "Confused": "Something didn't quite land.",
+            "Sad": "That didn't go as planned.",
+            "Error": "Something failed — want to retry?",
+        }
+        if getattr(self, "mood_label", None) is not None:
+            self.mood_label.setText(moods.get(state, moods["Idle"]))
+        if getattr(self, "companion_note", None) is not None:
+            self.companion_note.setText(notes.get(state, notes["Idle"]))
+        if getattr(self, "status_dot", None) is not None:
+            self.status_dot.set_color(color)
         avatar_state = {
             "Listening": "listening",
             "Thinking": "thinking",
+            "Searching": "searching",
             "Speaking": "speaking",
             "Working": "thinking",
             "Happy": "happy",
@@ -767,6 +1236,20 @@ class UI(QMainWindow):
         self.avatar.set_accent(color)
         self.floating_avatar.set_state(avatar_state)
         self.floating_avatar.avatar.set_accent(color)
+        companion_avatar = getattr(self, "companion_avatar", None)
+        if companion_avatar is not None:
+            companion_avatar.set_state(avatar_state)
+            companion_avatar.set_accent(color)
+        companion_state = getattr(self, "companion_state", None)
+        if companion_state is not None:
+            companion_state.setText(label)
+            companion_state.setStyleSheet(
+                f"color: {color}; background-color: {p['card_alt']}; "
+                "border: 1px solid " + p["border_bright"] + "; "
+                "border-radius: 12px; padding: 5px 14px; font-weight: 600;"
+            )
+        if getattr(self, "companion_mood", None) is not None:
+            self.companion_mood.setText(moods.get(state, moods["Idle"]))
         if getattr(self, "_avatar_state_name", None) != state:
             self._avatar_state_name = state
             if state != "Idle":
@@ -783,10 +1266,39 @@ class UI(QMainWindow):
     def toggle_floating_avatar(self):
         if self.floating_avatar.isVisible():
             self.floating_avatar.hide()
-            self.floating_avatar_btn.setText("Floating avatar")
+            self.floating_avatar_btn.setText("↗ Float")
+            self.floating_avatar_btn.setToolTip("Keep Himari on top of other windows")
         else:
             self.floating_avatar.show()
-            self.floating_avatar_btn.setText("Hide avatar")
+            self.floating_avatar_btn.setText("◱ Dock")
+            self.floating_avatar_btn.setToolTip("Return Himari to the main window")
+    def _restore_from_floating(self):
+        self.floating_avatar.hide()
+        self.floating_avatar_btn.setText("↗ Float")
+        self.floating_avatar_btn.setToolTip("Keep Himari on top of other windows")
+        self.show(); self.raise_(); self.activateWindow()
+    def _page_shell(self, title, subtitle):
+        page=QWidget(); page.setObjectName("Page")
+        layout=QVBoxLayout(page)
+        layout.setContentsMargins(22,14,22,18); layout.setSpacing(10)
+        head=QHBoxLayout(); head.setSpacing(12)
+        text_col=QVBoxLayout(); text_col.setSpacing(2)
+        title_label=QLabel(title); title_label.setObjectName("PageTitle")
+        subtitle_label=QLabel(subtitle); subtitle_label.setObjectName("PageSubtitle")
+        subtitle_label.setWordWrap(True)
+        text_col.addWidget(title_label); text_col.addWidget(subtitle_label)
+        head.addLayout(text_col,1)
+        layout.addLayout(head)
+        layout.addWidget(AuroraDivider(self._colors))
+        return page, layout, head
+    def _glass_card(self):
+        card=QFrame(); card.setObjectName("GlassCard")
+        body=QVBoxLayout(card)
+        body.setContentsMargins(16,14,16,16); body.setSpacing(10)
+        return card, body
+    def _sync_nav(self, index):
+        for nav_index, button in getattr(self, "_nav_buttons", {}).items():
+            button.setChecked(int(nav_index) == int(index))
     def _status(self,s):
         self.status_label.setText(s)
         if "error" in s.lower() or "failed" in s.lower():
@@ -794,10 +1306,17 @@ class UI(QMainWindow):
         elif "listening" in s.lower():
             self._set_avatar_state("Listening")
         elif (
+            "search" in s.lower()
+            or "checking the web" in s.lower()
+            or "looking through" in s.lower()
+        ):
+            self._set_avatar_state("Searching")
+        elif (
             "generating" in s.lower()
             or "responding" in s.lower()
             or "thinking" in s.lower()
             or "checking" in s.lower()
+            or "transcrib" in s.lower()
         ):
             self._set_avatar_state("Thinking")
         elif "speaking" in s.lower():
@@ -947,17 +1466,60 @@ class UI(QMainWindow):
         self._render_chat(force_scroll=True)
         self._load_sessions(select=self.session)
         self._flash_expression("Confused", 1200)
+    def _poll_voice(self):
+        waves = [
+            wave
+            for wave in (
+                getattr(self, "voice_wave", None),
+                getattr(self, "companion_wave", None),
+            )
+            if wave is not None
+        ]
+        if not waves:
+            return
+        recording = getattr(self, "mic", None) is not None and self.mic.rec
+        speaking = bool(getattr(self, "_tts_active", False))
+        for wave in waves:
+            if recording:
+                wave.set_mode("listening")
+                wave.set_level(getattr(self.mic, "level", 0.0))
+            elif speaking:
+                wave.set_mode("speaking")
+            else:
+                wave.set_mode("idle")
+        if not recording and not speaking:
+            timer = getattr(self, "_voice_timer", None)
+            if timer is not None:
+                timer.stop()
+    def _on_tts_finished(self):
+        self._tts_active = False
+        if not self.busy:
+            self.status.emit("Ready.")
+    def _on_tts_error(self, message):
+        self._tts_active = False
+        self.status.emit(f"TTS error: {message}")
+    def _stop_voice(self):
+        self._tts_active = False
+        self.tts.stop()
+        self._poll_voice()
+        if not self.busy:
+            self._status("Ready.")
     def _speak(self,t):
         if not self._voice_replies():
             self._status("Ready.")
             return
         try:
             if t.strip():
+                self._tts_active = True
+                if getattr(self, "_voice_timer", None) is not None:
+                    self._voice_timer.start()
                 self.status.emit("Speaking… click Stop voice to interrupt.")
                 self.tts.speak(t)
             else:
                 self._status("Ready.")
-        except Exception as e: self._status(f"TTS unavailable: {e}")
+        except Exception as e:
+            self._tts_active = False
+            self._status(f"TTS unavailable: {e}")
     def attach_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
             self,
@@ -1102,11 +1664,11 @@ class UI(QMainWindow):
         privacy = load().get("privacy", {})
         if privacy.get("store_conversations", True) and privacy.get("auto_memory", True):
             try:
-                if db.suggest_memory(text):
+                if db.remember_request(text):
                     self.refresh_mem()
             except Exception as exc:
-                log.exception("Could not save a memory suggestion")
-                self.status.emit(f"Memory suggestion error: {exc}")
+                log.exception("Could not save a memory")
+                self.status.emit(f"Memory save error: {exc}")
         self._begin_generation(text, screen_context, attachments)
     def retry_last(self):
         if self.busy:
@@ -1213,9 +1775,15 @@ class UI(QMainWindow):
             deep_reasoning = bool(
                 load().get("ollama", {}).get("deep_reasoning", True)
             )
-            think = deep_reasoning and (
-                needs_research or bool(image_atts) or persona.should_think(text)
-            )
+            intent = None
+            environment = None
+            try:
+                intent = IntentEngine().understand(text)
+                environment = EnvironmentContext().brief(intent)
+            except Exception as exc:
+                log.warning("Intent or environment analysis failed: %s", exc)
+            chat_tools = tools_for_intent(intent)
+            think = deep_reasoning and persona.should_think(text)
             self._waiting_label = (
                 "Thinking deeply about this…"
                 if think
@@ -1241,15 +1809,29 @@ class UI(QMainWindow):
                     if think
                     else "Thinking through your question…"
                 )
-            relevant = db.relevant_memories(text, limit=8)
+            relevant = db.relevant_memories(text, limit=10)
             if MemoryManager().enabled():
                 try:
                     relevant = [
                         {"text": memory.text}
-                        for memory in retrieve_memories(text, limit=8)
+                        for memory in retrieve_memories(text, limit=10)
                     ] or relevant
                 except Exception as exc:
                     log.warning("Memory retrieval failed: %s", exc)
+                recent = [
+                    {"text": memory.get("text", "")}
+                    for memory in db.memories(limit=5)
+                ]
+                combined = []
+                seen = set()
+                for memory in list(relevant or []) + recent:
+                    value = str(memory.get("text") or "").strip()
+                    key = value.casefold()
+                    if not value or key in seen:
+                        continue
+                    seen.add(key)
+                    combined.append({"text": value})
+                relevant = combined[:12]
             else:
                 relevant = []
             summary = db.summary_for_session(self.session)
@@ -1278,7 +1860,10 @@ class UI(QMainWindow):
                 research=research,
                 attachments=attachment_block,
                 vision=vision_text,
-                directive=persona.diagram_directive(text),
+                directive=persona.directive_for(text),
+                tools=chat_tools,
+                intent=intent,
+                environment=environment,
             )
         except Exception as exc:
             log.exception("Chat preparation failed")
@@ -1287,7 +1872,7 @@ class UI(QMainWindow):
         if cancel_event.is_set():
             self.cancelled.emit("")
             return
-        self._run(msgs, cancel_event, think=think)
+        self._run(msgs, cancel_event, think=think, tools=chat_tools)
     def _ocr_attachment_text(self, image_attachments):
         parts = []
         for attachment in image_attachments:
@@ -1303,17 +1888,20 @@ class UI(QMainWindow):
             if text:
                 parts.append(text[:6000])
         return "\n\n".join(parts)
-    def _run(self,msgs,cancel_event=None,think=False):
+    def _run(self,msgs,cancel_event=None,think=False,tools=None):
         out=[]
         def on_token(t): out.append(t); self.token.emit(t)
+        def on_tool(n,a,r):
+            self.tool.emit(f"{n} {a} → {as_text(r)}")
         try:
             self.llm.stream_chat(
                 msgs,
                 on_token,
-                on_tool=lambda n,a,r: self.tool.emit(f"{n} {a} → {r}"),
+                on_tool=on_tool,
                 cancel_event=cancel_event,
                 on_status=self.status.emit,
                 think=think,
+                tools=tools,
             )
             self.done.emit("".join(out))
         except LLMCancelled as exc:
@@ -1335,6 +1923,13 @@ class UI(QMainWindow):
             content = args.get("content", "")
             details = (
                 f"File: {args.get('filename', '')}\n"
+                f"Characters: {len(content) if isinstance(content, str) else 0}\n\n"
+                f"Preview: {content[:500] if isinstance(content, str) else ''}"
+            )
+        elif name in {"apply_change", "propose_change"}:
+            content = args.get("new_content", "")
+            details = (
+                f"File: {args.get('path', '')}\n"
                 f"Characters: {len(content) if isinstance(content, str) else 0}\n\n"
                 f"Preview: {content[:500] if isinstance(content, str) else ''}"
             )
@@ -1379,6 +1974,7 @@ class UI(QMainWindow):
     def _auto_stop_mic(self):
         if self.mic.rec:
             audio=self.mic.stop(); self.mic_btn.setText(self._talk_label())
+            self._poll_voice()
             self._status("Voice detected; transcribing locally…")
             threading.Thread(
                 target=self._transcribe,
@@ -1389,6 +1985,7 @@ class UI(QMainWindow):
     def toggle_mic(self):
         if self.mic.rec:
             audio=self.mic.stop(); self.mic_btn.setText(self._talk_label())
+            self._poll_voice()
             self._status("Transcribing locally…")
             threading.Thread(
                 target=self._transcribe,
@@ -1397,9 +1994,12 @@ class UI(QMainWindow):
             ).start()
         else:
             try:
+                self._tts_active = False
                 self.tts.stop()
                 self.mic.start(on_silence=None)
                 self.mic_btn.setText("Stop & Transcribe")
+                if getattr(self, "_voice_timer", None) is not None:
+                    self._voice_timer.start()
                 self._status("Listening… click Stop & Transcribe when you’re done.")
             except Exception as e: self._status(f"Microphone error: {e}")
     def _recognition_language(self):
@@ -1724,8 +2324,14 @@ class UI(QMainWindow):
         self.activity_list.clear()
         for action in db.recent_actions():
             timestamp=datetime.fromtimestamp(action["ts"]).strftime("%Y-%m-%d %H:%M:%S")
-            self.activity_list.addItem(
-                f"{timestamp}  {action['tool']}  allowed={bool(action['approved'])}\n{action['result']}")
+            text = (
+                f"{timestamp}  {action['tool']}  "
+                f"allowed={bool(action['approved'])}"
+            )
+            result = str(action["result"] or "").strip()
+            if result:
+                text += f"\n{result}"
+            self.activity_list.addItem(text)
     def refresh_dashboard(self):
         if self._dashboard_running:
             return
@@ -1750,9 +2356,11 @@ class UI(QMainWindow):
         self.dash_activity.clear()
         for row in snapshot["recent_activity"]:
             status = "allowed" if row["approved"] else "denied"
-            self.dash_activity.addItem(
-                f"{row['display_time']}  {row['tool']}  [{status}]\n{row['result'][:200]}"
-            )
+            text = f"{row['display_time']}  {row['tool']}  [{status}]"
+            result = str(row["result"] or "").strip()[:200]
+            if result:
+                text += f"\n{result}"
+            self.dash_activity.addItem(text)
     def run_diagnostics(self):
         if self._diag_running:
             return
@@ -1772,6 +2380,132 @@ class UI(QMainWindow):
             self.diag_text.setPlainText(f"Diagnostics error: {error}")
             return
         self.diag_text.setPlainText(control_diagnostics.format_diagnostics(checks))
+    # ---- watch companion --------------------------------------------
+    def toggle_watch(self):
+        try:
+            from .skills import watch
+
+            running = watch.session().status().get("running")
+        except Exception as exc:
+            self._status(f"Watch is unavailable: {exc}")
+            return
+        if running:
+            self.stop_watch()
+        else:
+            self.start_watch()
+    def start_watch(self):
+        try:
+            from .skills import watch
+
+            status = watch.session().start()
+        except Exception as exc:
+            self._status(f"Watch not started: {exc}")
+            return
+        self._apply_watch_status(status)
+        self._status(
+            "Watch started. She takes one local look every few seconds, shows the "
+            "indicator, and stops automatically."
+        )
+    def stop_watch(self):
+        try:
+            from .skills import watch
+
+            watch.session().stop("stopped from the UI")
+            status = watch.session().status()
+        except Exception as exc:
+            self._status(f"Could not stop the watch session: {exc}")
+            return
+        self._apply_watch_status(status)
+        self._status("Watch stopped. The observations were in-memory only.")
+    def _poll_watch(self):
+        try:
+            from .skills import watch
+
+            status = watch.session().status()
+        except Exception:
+            return
+        self._apply_watch_status(status)
+    def _apply_watch_status(self, status):
+        status = status or {}
+        running = bool(status.get("running"))
+        self.watch_card.setVisible(running)
+        remaining = str(status.get("remaining_text") or "")
+        self.watch_left.setText(remaining)
+        self.companion_watch_btn.setText("Stop watching" if running else "Watch with me")
+        if running:
+            last = status.get("last") or {}
+            subject = last.get("game") or last.get("application") or "your screen"
+            self.companion_watch_status.setText(
+                f"Watching {subject} · {remaining} left · screenshots discarded"
+            )
+        else:
+            interval = status.get("interval_seconds") or 20
+            cap = status.get("limit_minutes") or 30
+            self.companion_watch_status.setText(
+                f"Watch is off — a session would look every {interval}s, "
+                f"at most {cap} min, and save nothing."
+            )
+    # ---- setup coach ------------------------------------------------
+    def _coach_topic_key(self):
+        return str(self.coach_topic.currentData() or "spotify")
+    def show_coach_guide(self):
+        topic = self._coach_topic_key()
+        try:
+            from .skills import coach
+
+            text = coach.setup_guide(topic)
+        except Exception as exc:
+            text = f"Could not build the {topic} guide: {exc}"
+        self.coach_text.setPlainText(text)
+    def verify_coach_setup(self):
+        topic = self._coach_topic_key()
+        self.coach_verify_btn.setEnabled(False)
+        self.coach_text.setPlainText(f"Checking {topic}…")
+        def work():
+            try:
+                from .skills import coach
+
+                text = coach.setup_verify(topic)
+            except Exception as exc:
+                text = f"The {topic} check failed: {exc}"
+            self.coach_ready.emit(str(text))
+        threading.Thread(target=work, daemon=True).start()
+    def _apply_coach(self, text):
+        self.coach_verify_btn.setEnabled(True)
+        self.coach_text.setPlainText(str(text or ""))
+    # ---- system doctor ----------------------------------------------
+    def run_doctor_system(self):
+        from .skills import doctor
+
+        self._run_doctor(doctor.inspect_system, "Inspecting the system (read-only)…")
+    def run_doctor_program(self):
+        name = self.doctor_name.text().strip()
+        if not name:
+            self.doctor_text.setPlainText(
+                "Type the program or game name first, then press Diagnose program."
+            )
+            return
+        from .skills import doctor
+
+        self._run_doctor(
+            lambda: doctor.diagnose_program(name),
+            f"Diagnosing {name} (read-only)…",
+        )
+    def _run_doctor(self, task, message):
+        self.doctor_system_btn.setEnabled(False)
+        self.doctor_program_btn.setEnabled(False)
+        self.doctor_text.setPlainText(message)
+        def work():
+            try:
+                text = task()
+            except Exception as exc:
+                text = f"System Doctor failed: {exc}"
+            self.doctor_ready.emit(str(text))
+        threading.Thread(target=work, daemon=True).start()
+    def _apply_doctor(self, text):
+        self.doctor_system_btn.setEnabled(True)
+        self.doctor_program_btn.setEnabled(True)
+        self.doctor_text.setPlainText(str(text or ""))
     def run_agent_task(self):
         if self.agent_running:
             return
@@ -1783,9 +2517,14 @@ class UI(QMainWindow):
         self.busy = True
         self._agent_token = CancellationToken()
         self.agent_run_btn.setEnabled(False); self.agent_cancel_btn.setEnabled(True)
-        self.agent_status_label.setText("Agent: planning")
+        self.agent_status_label.setText("Agent: Understanding the request")
+        self.agent_plan.clear()
+        self.agent_report.clear()
         self.status_label.setText("Working on the task…")
         self._set_avatar_state("Working")
+        self._append_message("user", task)
+        self._persist_message("user", task)
+        self._render_chat(force_scroll=True)
         token = self._agent_token
         def confirm(name, args, message):
             result=new_decision()
@@ -1796,6 +2535,7 @@ class UI(QMainWindow):
                 orchestrator = AgentOrchestrator(
                     confirm_callback=confirm,
                     on_status=lambda event: self.agent_status.emit(event),
+                    persist=True,
                 )
                 state = orchestrator.run(task, token=token)
                 self.agent_finished.emit(state.to_dict())
@@ -1809,25 +2549,115 @@ class UI(QMainWindow):
         if self._agent_token is not None:
             self._agent_token.cancel()
             self._release_confirmations()
-            self.agent_status_label.setText("Agent: cancelling…")
+            self.agent_status_label.setText("Agent: Cancelling…")
     def _agent_progress(self, event):
-        self.agent_status_label.setText(f"Agent: {event['status']} — {event['detail']}")
-        if event["status"] in (
-            "understanding", "planning", "waiting_for_permission",
-            "executing", "observing", "verifying",
-        ):
-            self._set_avatar_state("Working")
+        status = str(event.get("status") or "")
+        label = AGENT_STATUS_LABELS.get(status, status.replace("_", " ").capitalize())
+        detail = str(event.get("detail") or "").strip()
+        self.agent_status_label.setText(f"Agent: {label}" + (f" — {detail}" if detail else ""))
+        self._set_avatar_state(AGENT_STATUS_AVATARS.get(status, "Working"))
+        self._render_task_plan(event.get("plan"), event.get("steps"))
+        if detail:
+            stamp = datetime.now().strftime("%H:%M:%S")
+            self.activity_list.insertItem(0, f"{stamp}  agent  [{status}]\n{detail}")
+            while self.activity_list.count() > 250:
+                self.activity_list.takeItem(self.activity_list.count() - 1)
+    def _render_task_plan(self, plan, steps):
+        self.agent_plan.clear()
+        plan_steps = None
+        if isinstance(plan, dict):
+            plan_steps = plan.get("steps")
+        elif isinstance(plan, list):
+            plan_steps = plan
+        rows = plan_steps or steps or []
+        for step in rows:
+            if not isinstance(step, dict):
+                continue
+            verification = step.get("verification") or {}
+            recovery = step.get("recovery") or {}
+            check = (
+                str(verification.get("detail") or "")
+                or str(step.get("error") or "")
+                or str(recovery.get("reason") or "")
+                or str(step.get("expected") or "")
+            )
+            status = str(step.get("status") or "pending")
+            objective = str(step.get("objective") or step.get("id") or "Step")
+            tool = str(step.get("tool") or "")
+            item = QTreeWidgetItem(
+                [
+                    objective[:160],
+                    tool,
+                    STEP_STATUS_LABELS.get(status, status),
+                    check[:180],
+                ]
+            )
+            item.setToolTip(0, objective)
+            if tool:
+                item.setToolTip(1, tool)
+            if check:
+                item.setToolTip(3, check)
+            status_color = {
+                "succeeded": self._colors["success"],
+                "running": self._colors["accent"],
+                "failed": self._colors["error"],
+                "denied": self._colors["warning"],
+                "invalid": self._colors["warning"],
+                "skipped": self._colors["muted"],
+            }.get(status)
+            if status_color:
+                item.setForeground(2, QColor(status_color))
+            self.agent_plan.addTopLevelItem(item)
+        if rows:
+            self.agent_plan.resizeColumnToContents(0)
+            self.agent_plan.resizeColumnToContents(1)
+            self.agent_plan.resizeColumnToContents(2)
+    def open_selected_task(self):
+        item = self.task_history.currentItem()
+        if item is None:
+            self._status("Select a saved task first.")
+            return
+        record = db.load_task(item.data(Qt.UserRole))
+        if not record:
+            self._status("That task record could not be loaded.")
+            return
+        payload = record.get("payload") or {}
+        status = str(payload.get("status") or record.get("status") or "unknown")
+        self.agent_status_label.setText(
+            f"Agent: {AGENT_STATUS_LABELS.get(status, status)} — saved task"
+        )
+        self._render_task_plan(payload.get("plan"), payload.get("steps"))
+        self.agent_report.setPlainText(
+            str(payload.get("report") or payload.get("error") or "No report was saved for this task.")
+        )
+    def refresh_tasks(self):
+        self.task_history.clear()
+        try:
+            records = db.recent_tasks(limit=15)
+        except Exception as exc:
+            log.warning("Could not read recent tasks: %s", exc)
+            return
+        for record in records:
+            when = datetime.fromtimestamp(record["updated"]).strftime("%m-%d %H:%M")
+            item = QListWidgetItem(
+                f"{when}  [{record['status']}]  {str(record['objective'])[:80]}"
+            )
+            item.setData(Qt.UserRole, record["id"])
+            self.task_history.addItem(item)
     def _agent_done(self, state):
         self.agent_running = False
         self.busy = False
         self._agent_token = None
         self.agent_run_btn.setEnabled(True); self.agent_cancel_btn.setEnabled(False)
-        status = state.get("status", "failed")
+        status = str(state.get("status") or "failed")
         verified = state.get("verified", True)
+        label = AGENT_STATUS_LABELS.get(status, status)
         if status == "completed" and not verified:
-            self.agent_status_label.setText("Agent: completed (some steps unverified)")
-        else:
-            self.agent_status_label.setText(f"Agent: {status}")
+            label = "Completed, but some steps unverified"
+        self.agent_status_label.setText(f"Agent: {label}")
+        self._render_task_plan(state.get("plan"), state.get("steps"))
+        report = state.get("final_answer") or state.get("error") or ""
+        self.agent_report.setPlainText(str(report))
         if state.get("final_answer"):
             self._append_message("assistant", state["final_answer"])
             self._persist_message("assistant", state["final_answer"])
@@ -1837,12 +2667,21 @@ class UI(QMainWindow):
                 "This task finished, but at least one step was denied, invalid, or "
                 "failed. Check the steps above before trusting the result.",
             )
+        if status == "partially_completed":
+            self._append_message(
+                "system",
+                "Only part of this task was completed. The remaining steps were "
+                "not done; the report lists what failed and why.",
+            )
+        if status == "cancelled":
+            self._append_message("system", "The task was cancelled before it finished.")
         if status == "failed" and state.get("error"):
             self._append_message("error", f"Agent error: {state['error']}")
         self._render_chat(force_scroll=True)
         self._load_sessions(select=self.session)
-        self._set_avatar_state("Error" if status == "failed" else "Idle")
+        self._set_avatar_state(AGENT_STATUS_AVATARS.get(status, "Idle"))
         self.refresh_actions(); self.refresh_mem(); self.refresh_dashboard()
+        self.refresh_tasks()
     def add_mem(self):
         text,ok=QInputDialog.getText(self,"Add memory","Memory:")
         if ok and text:
@@ -1905,22 +2744,32 @@ class UI(QMainWindow):
             self.cb_apps,self.cb_web,self.cb_research,
             self.cb_screen,self.cb_screen_control,
             self.cb_active_window,self.cb_media,self.cb_browser,
-            self.cb_write,self.cb_vision,
+            self.cb_watch_mode,self.cb_diagnostics,self.cb_vscode_state,
+            self.cb_run_tests,self.cb_write,self.cb_vision,
             self.cb_preload,self.cb_deep_reasoning,
             self.cb_always_on_top,self.cb_minimize_to_tray,
+            self.cb_weather_auto,self.cb_auto_escalate,
         ):
             box.toggled.connect(self._schedule_settings_save)
         for box in (
             self.mic_box,self.out_box,self.lang_box,self.voice_box,
             self.chat_engine_box,self.screen_area,
+            self.weather_units,self.reasoning_profile,
         ):
             box.currentIndexChanged.connect(self._schedule_settings_save)
-        for widget in (self.vol,self.sensitivity,self.reply_wait):
+        for widget in (
+            self.vol,self.sensitivity,self.reply_wait,
+            self.reasoning_rounds,self.calendar_duration,
+            self.watch_interval,self.watch_cap,
+        ):
             widget.valueChanged.connect(self._schedule_settings_save)
         for listing in (self.allowed_folders,self.development_workspaces):
             listing.model().rowsInserted.connect(self._schedule_settings_save)
             listing.model().rowsRemoved.connect(self._schedule_settings_save)
-        for field in (self.embedding_model,self.wake_word_field,self.ollama_host):
+        for field in (
+            self.embedding_model,self.wake_word_field,self.ollama_host,
+            self.spotify_client_id,self.spotify_secret,self.weather_city,
+        ):
             field.editingFinished.connect(self._save_text_settings)
         for combo in (self.model_box,self.vision_model_box):
             combo.currentTextChanged.connect(self._save_text_settings)
@@ -1950,6 +2799,10 @@ class UI(QMainWindow):
                 "allow_active_window": self.cb_active_window.isChecked(),
                 "allow_media_control": self.cb_media.isChecked(),
                 "allow_browser_automation": self.cb_browser.isChecked(),
+                "allow_watch_mode": self.cb_watch_mode.isChecked(),
+                "allow_system_diagnostics": self.cb_diagnostics.isChecked(),
+                "allow_vscode_state": self.cb_vscode_state.isChecked(),
+                "allow_run_tests": self.cb_run_tests.isChecked(),
                 "allow_run_command": False,
                 "allow_write_file": self.cb_write.isChecked(),
                 "allow_vision": self.cb_vision.isChecked(),
@@ -1987,12 +2840,31 @@ class UI(QMainWindow):
             "screen": {
                 "monitor": str(self.screen_area.currentData() or "primary"),
                 "region": getattr(self, "_screen_region", None),
+                "watch_interval_seconds": self.watch_interval.value(),
+                "watch_max_minutes": self.watch_cap.value(),
+            },
+            "location": {
+                "units": self.weather_units.currentData() or "metric",
+                "auto_detect": self.cb_weather_auto.isChecked(),
+            },
+            "reasoning": {
+                "profile": self.reasoning_profile.currentData() or "auto",
+                "auto_escalate": self.cb_auto_escalate.isChecked(),
+                "max_rounds": self.reasoning_rounds.value(),
+            },
+            "calendar": {
+                "default_duration_minutes": self.calendar_duration.value(),
             },
         }
         if self.voice_box.count():
             updates["voice"]["tts_voice"] = self.voice_box.currentText()
         if not text_fields:
             return updates
+        updates["location"]["city"] = self.weather_city.text().strip()
+        updates["spotify"] = {
+            "client_id": self.spotify_client_id.text().strip(),
+            "client_secret": self.spotify_secret.text().strip(),
+        }
         updates["ollama"]["vision_model"] = (
             self.vision_model_box.currentText().strip() or "qwen2.5vl:3b"
         )
@@ -2015,9 +2887,14 @@ class UI(QMainWindow):
         if include_text is None:
             include_text = bool(interactive)
         try:
-            control_settings.SettingsService().update(
-                self._settings_updates(text_fields=include_text)
-            )
+            updates = self._settings_updates(text_fields=include_text)
+        except RuntimeError as exc:
+            # Widgets are torn down one by one at shutdown; a pending
+            # editingFinished save can then read an already-deleted sibling.
+            log.debug("Settings save skipped during teardown: %s", exc)
+            return False
+        try:
+            control_settings.SettingsService().update(updates)
         except control_settings.SettingsError as exc:
             log.warning("Settings were not saved: %s", exc)
             if interactive:
@@ -2124,6 +3001,45 @@ class UI(QMainWindow):
         first_time = not getattr(self, "_window_shown_once", False)
         self._window_shown_once = True
         ui_effects.fade_window(self, first_time=first_time)
+    def shutdown_web_engine(self):
+        """Release QtWebEngine before the app exits.
+
+        A live profile keeps QtWebEngineProcess.exe and its files in the
+        PyInstaller temp folder, which makes the one-file bootloader report a
+        failed _MEI cleanup. Tearing the view down first avoids that.
+        """
+        timer = getattr(self, "_settings_save_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+        view = getattr(self, "chat", None)
+        if view is None:
+            return
+        profile = getattr(view, "_profile", None)
+        try:
+            page = view.page()
+            if page is not None:
+                page.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
+        try:
+            view.setParent(None)
+            view.deleteLater()
+        except RuntimeError:
+            pass
+        self.chat = None
+        if profile is not None:
+            try:
+                profile.deleteLater()
+            except RuntimeError:
+                pass
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+            time.sleep(0.25)
+            app.processEvents()
     def closeEvent(self,e):
         self._release_confirmations()
         self._save_settings(interactive=True)
@@ -2163,4 +3079,12 @@ def run():
     w=UI()
     guard.activated.connect(lambda:(w.show(),w.raise_(),w.activateWindow()))
     w.show()
-    sys.exit(app.exec())
+    code=app.exec()
+    try:
+        w.shutdown_web_engine()
+        import gc
+        gc.collect()
+        app.processEvents()
+    except Exception as exc:
+        log.debug("Web engine shutdown cleanup failed: %s", exc)
+    sys.exit(code)

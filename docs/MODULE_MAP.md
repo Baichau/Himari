@@ -1,6 +1,6 @@
 # Himari 4 — Module Map
 
-Generated from the current source tree (`himari/`, 100 Python modules, ~16.9k lines).
+Generated from the current source tree (`himari/`, 125 Python modules, ~27.6k lines).
 “Entry points” are the functions/classes other modules actually call.
 
 ## Application shell
@@ -52,7 +52,7 @@ Generated from the current source tree (`himari/`, 100 Python modules, ~16.9k li
 
 | Module | Responsibility | Key entry points | Notes |
 |---|---|---|---|
-| `tools.py` | 38-tool registry, app/file/browser/research/media/screen-control handlers | `TOOLS`, `research_web`, `open_app`, `list_controls_tool`, `click_control_tool` | risk/permissions external; duplicate close logic lives here too |
+| `tools.py` | Core tool registry plus shared app/file/browser/research/media handlers | `TOOLS` (69 entries after `skills.skill_tools()` is merged), `research_web`, `open_app`, `list_controls_tool`, `click_control_tool` | risk/permissions external; duplicate close logic lives here too |
 | `research.py` | Regex research router + DuckDuckGo query + cache | `should_research`, `research_for_prompt` | snippets only, single query |
 | `browser/browser_manager.py` | Playwright launch with isolated context | `BrowserManager` | installed browsers only |
 | `browser/session.py` | Dedicated thread + queue RPC, permission gate | `session.call`, `shutdown` | sync Playwright isolation |
@@ -79,12 +79,27 @@ Generated from the current source tree (`himari/`, 100 Python modules, ~16.9k li
 | `integrations/vscode.py` | VS Code open/status | methods | |
 | `integrations/chrome.py` | Chrome open/status | methods | |
 | `integrations/discord.py` | Discord status | methods | sending refused |
-| `development/workspace.py` | Approved dev workspaces | `discover_workspaces`, `workspace_for` | used by `development/launcher.py` |
+| `development/workspace.py` | Approved dev workspaces and the last opened project | `discover_workspaces`, `workspace_for`, `set_active_project`, `active_project` | used by `development/launcher.py`, `open_project`, `read_file` |
 | `development/launcher.py` | Find/create a project and open it in VS Code | `find_project`, `create_project`, `open_in_editor` | reachable through the `open_project` tool; workspace-scoped |
 | `development/editor.py` | Apply code changes | `apply_change` | not exposed |
-| `development/code_search.py` | Search within workspace | `search_code` | not exposed |
+| `development/code_search.py` | Search within workspace | `search_code` | exposed through the `search_code` tool |
 | `development/file_reader.py` | Read source files | `read_source` | not exposed |
 | `development/test_runner.py` | Run project tests | `run_tests` | not exposed |
+
+## Companion skills
+
+Modular tools added on 2026-11-14. `skills/__init__.py` exposes `skill_tools()`, which
+`tools.py` merges into `TOOLS` after the core list is built; duplicate names are dropped.
+
+| Module | Responsibility | Key entry points | Notes |
+|---|---|---|---|
+| `skills/__init__.py` | Aggregates module `TOOLS` lists | `skill_tools` | imported at the end of `tools.py`; first definition wins |
+| `skills/watch.py` | Opt-in bounded watch session, game detection, in-memory observations | `WatchSession`, `session`, `watch_start`, `watch_stop`, `watch_status`, `watch_observe`, `detect_game` | interval from Settings (default 20 s), 30 min cap, permission re-checked every tick, nothing persisted |
+| `skills/coach.py` | Setup playbooks, topic aliases, secret masking, live verification | `setup_guide`, `setup_verify`, `playbook_status`, `inspect_settings`, `setup_remember` | reports whether a secret exists, never its value |
+| `skills/doctor.py` | Read-only system/program diagnosis and event-log summarization | `inspect_system`, `diagnose_program`, `recent_system_events`, `recent_app_events` | redacts sensitive text; refuses service/registry/startup/security changes |
+| `skills/pair.py` | Reads VS Code workspace state and open editors; diff-first edits; allowlisted tests | `open_editors`, `read_open_file`, `propose_change`, `apply_change`, `run_project_tests` | gated by `allow_vscode_state`; window-title fallback when state is unreadable |
+| `skills/media.py` | Public YouTube caption fetch and timedtext parsing | `youtube_transcript`, `video_id`, `caption_url`, `parse_timedtext` | needs `allow_web_research`; bounded response, no download or playback |
+| `skills/continuity.py` | Activity memory and combined project context | `remember_activity`, `project_context` | writes the `activity` category; context is assembled read-only |
 
 ## Memory and data
 
@@ -127,14 +142,16 @@ Generated from the current source tree (`himari/`, 100 Python modules, ~16.9k li
 - No import cycles were found at module import time. The heavy coupling is architectural, not cyclic:
   `ui.py` imports almost everything, and `tools.py` is imported by `research.py`, `persona.py` (lazily),
   the agent registry, integrations, and tests.
-- Three parallel “capability→UI” paths exist: `tools.TOOLS`, the agent registry, and
-  `integrations/` + `development/`. The `open_project` tool now reaches
-  `development/launcher.py`; the rest of `development/` and the integration classes are still
-  not registered as tools.
-- Dead or unreachable code today: `control/settings.py`, `memory/extraction.py`, most of
-  `development/*`, and integration tools (no matching entries in `tools.TOOLS`) — except
-  `development/launcher.py`, which `open_project` uses. `perception/scene.build_scene` and the
-  safe read-only environment helpers (`installed_apps`, `list_windows`, `running_processes`,
-  `find_app`) are reachable through `tools.TOOLS`.
+- Three parallel “capability→UI” paths exist: `tools.TOOLS` (which now includes the `skills/`
+  package through `skill_tools()`), the agent registry, and `integrations/` + `development/`. The
+  `open_project` tool reaches `development/launcher.py`, and `skills/pair.py` covers the
+  read/diff/apply/test portion of `development/`; the integration classes are still not
+  registered as tools.
+- Dead or unreachable code today: `control/settings.py`, `memory/extraction.py`, and integration
+  tools (no matching entries in `tools.TOOLS`). `development/launcher.py` backs `open_project`,
+  `development/code_search.py` backs `search_code`, and `skills/pair.py` uses the same workspace
+  rules for reading and editing. `perception/scene.build_scene` and the safe read-only environment
+  helpers (`installed_apps`, `list_windows`, `running_processes`, `find_app`) are reachable through
+  `tools.TOOLS` and the watch/doctor skills.
 - Prompt logic is split between `persona.py` and `personality/`; only the former is used for the
   main system prompt.

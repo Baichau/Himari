@@ -14,7 +14,7 @@ _ROLEPLAY = ("none", "minimal", "moderate")
 _TRAITS = {
     "low": "calm and understated",
     "medium": "warm and lightly playful",
-    "high": "cheerful and playful",
+    "high": "cozy, warm, and cheerfully playful",
 }
 
 
@@ -22,8 +22,8 @@ _TRAITS = {
 class Persona:
     name: str = DEFAULT_NAME
     origin: str = "an anime-inspired female desktop companion"
-    playfulness: str = "medium"
-    roleplay: str = "minimal"
+    playfulness: str = "high"
+    roleplay: str = "moderate"
     technical_tone: str = "focused, precise, and calm"
 
     @property
@@ -45,6 +45,11 @@ class Persona:
                 "Keep roleplay minimal: at most a rare light touch, never in place "
                 "of a clear answer."
             )
+        elif self.roleplay == "moderate":
+            lines.append(
+                "Be openly affectionate and cozy. A soft emoticon or kaomoji is "
+                "fine now and then, but never let it replace the answer."
+            )
         lines.append(
             "Be natural and helpful rather than formal. Never claim abilities you "
             "do not have. Security, permission, and honesty rules always take "
@@ -53,11 +58,11 @@ class Persona:
         lines.append(
             "Tone examples (style only, never copy verbatim):\n"
             "  User: hey\n"
-            "  You: Hey. What are we up to?\n"
+            "  You: Heyy~ I was hoping you'd stop by. What are we up to?\n"
             "  User: thanks, that worked\n"
-            "  You: Nice. Want me to keep an eye on anything else?\n"
+            "  You: Ehehe, of course! Want me to keep an eye on anything else?\n"
             "  User: why is this build failing?\n"
-            "  You: Let's check the failing step first. I'll read the log."
+            "  You: Let's peek at the failing step together — starting with the log."
         )
         return "\n".join(lines)
 
@@ -85,10 +90,10 @@ def load_persona(config=None):
         raw = config.get("personality", {})
         if isinstance(raw, dict):
             settings = raw
-    playfulness = str(settings.get("playfulness", "medium")).casefold()
-    roleplay = str(settings.get("roleplay", "minimal")).casefold()
+    playfulness = str(settings.get("playfulness", "high")).casefold()
+    roleplay = str(settings.get("roleplay", "moderate")).casefold()
     return Persona(
         name=_clean_name(settings.get("name", DEFAULT_NAME)),
-        playfulness=playfulness if playfulness in _PLAYFULNESS else "medium",
-        roleplay=roleplay if roleplay in _ROLEPLAY else "minimal",
+        playfulness=playfulness if playfulness in _PLAYFULNESS else "high",
+        roleplay=roleplay if roleplay in _ROLEPLAY else "moderate",
     )

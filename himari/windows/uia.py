@@ -288,6 +288,32 @@ def click_control(window, name, control_type=None):
     return f"Clicked {label} in '{title}'."
 
 
+def activate_control(window, name, control_type=None, double=False):
+    """Activate one named control, optionally with a double click.
+
+    List rows in media apps usually start playback only on a double click, so
+    callers can request that explicitly instead of guessing coordinates.
+    """
+    target = find_window(window)
+    title = _window_title(target)
+    _focus(target, title)
+    control, info = _match_control(target, name, control_type)
+    label = f"{info['name']} ({info['control_type'] or 'control'})"
+    try:
+        if double:
+            control.double_click_input()
+        else:
+            control.click_input()
+    except Exception as exc:
+        try:
+            control.invoke()
+        except Exception:
+            raise ScreenControlError(
+                f"Windows did not accept activation of {label} in '{title}': {exc}"
+            ) from exc
+    return f"Activated {label} in '{title}'."
+
+
 def set_control_text(window, name, text, control_type=None):
     """Replace the text of one named edit control; password fields are refused."""
     if not isinstance(text, str):

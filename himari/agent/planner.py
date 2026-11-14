@@ -1,7 +1,8 @@
-"""Planning step for the agent loop.
+"""Planning steps for the agent loop.
 
-The planner asks the existing local Ollama model for exactly one next action
-using native tool calling. It never executes anything itself.
+The planner asks the existing local Ollama model for either a small structured
+plan or exactly one next action using native tool calling. It never executes
+anything itself.
 """
 
 import json
@@ -9,6 +10,7 @@ import json
 import ollama
 
 from ..config import load
+from .plan import PLAN_PROMPT, TaskPlan
 
 SYSTEM_PROMPT = (
     "You are Himari's task agent. Work in small, verifiable steps.\n"
@@ -102,6 +104,69 @@ class Planner:
                 "content": content,
             }
         return {"type": "final", "content": content}
+
+    def make_plan(self, objective, tool_specs, token=None, max_steps=8):
+        """Ask for a structured plan. Returns a TaskPlan or None."""
+        if token is not None:
+            token.check()
+        names = []
+        for spec in tool_specs or []:
+            function = spec.get("function") if isinstance(spec, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if name:
+                names.append(name)
+        if not names:
+            return None
+        cfg = self._config()
+        prompt = (
+            PLAN_PROMPT
+            + "\nAvailable tools (use only these names):\n- "
+            + "\n- ".join(sorted(names))
+        )
+        payload = {
+            "model": self._model or cfg.get("chat_model", "qwen3:8b"),
+            "messages": [
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": str(objective)},
+            ],
+            "stream": False,
+            "think": False,
+            "format": "json",
+            "options": {
+                "temperature": (
+                    self._temperature
+                    if self._temperature is not None
+                    else min(0.3, float(cfg.get("temperature", 0.7)))
+                )
+            },
+        }
+        response = self._client_chat(**payload)
+        message = (
+            response.get("message")
+            if isinstance(response, dict)
+            else getattr(response, "message", None)
+        )
+        content = _field(message, "content") or ""
+        try:
+            data = json.loads(_strip_fence(content))
+            plan = TaskPlan.from_json(data, objective=str(objective))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        known = set(names)
+        plan.steps = [step for step in plan.steps if step.tool in known]
+        if len(plan.steps) > max(1, int(max_steps)):
+            plan.steps = plan.steps[:max_steps]
+        ok, _ = plan.validate()
+        return plan if ok else None
+
+
+def _strip_fence(text):
+    value = str(text or "").strip()
+    if value.startswith("```"):
+        value = value.split("\n", 1)[-1]
+        if value.rstrip().endswith("```"):
+            value = value.rstrip()[:-3]
+    return value.strip()
 
 
 def _field(source, name):

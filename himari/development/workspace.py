@@ -6,15 +6,43 @@ accessible. Workspace discovery is read-only and never creates folders.
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 from ..config import load as load_config
 
 log = logging.getLogger("himari.development")
 
+_active_project = None
+_active_lock = threading.Lock()
+
 
 class WorkspaceError(RuntimeError):
     """A path is outside the permitted workspaces or otherwise invalid."""
+
+
+def set_active_project(path):
+    """Remember the project folder the user just opened.
+
+    Only a folder inside a configured workspace is accepted, so later relative
+    reads can never escape the allow-list.
+    """
+    global _active_project
+    if path is None:
+        with _active_lock:
+            _active_project = None
+        return None
+    _, resolved = workspace_for(path)
+    if not resolved.is_dir():
+        raise WorkspaceError(f"'{resolved}' is not a project folder.")
+    with _active_lock:
+        _active_project = resolved
+    return resolved
+
+
+def active_project():
+    with _active_lock:
+        return _active_project
 
 
 def discover_workspaces():

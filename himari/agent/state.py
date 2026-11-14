@@ -23,7 +23,10 @@ class AgentStatus(str, Enum):
     EXECUTING = "executing"
     OBSERVING = "observing"
     VERIFYING = "verifying"
+    RECOVERING = "recovering"
+    WAITING_FOR_USER = "waiting_for_user"
     COMPLETED = "completed"
+    PARTIALLY_COMPLETED = "partially_completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
@@ -61,6 +64,14 @@ class AgentStep:
     risk: str = "high"
     result: object = None
     error: str = ""
+    objective: str = ""
+    plan_step_id: str = ""
+    verification: dict = field(default_factory=dict)
+    recovery: dict = field(default_factory=dict)
+
+    @property
+    def succeeded(self):
+        return self.status is StepStatus.SUCCEEDED
 
     def to_dict(self):
         return {
@@ -71,6 +82,10 @@ class AgentStep:
             "risk": self.risk,
             "result": self.result,
             "error": self.error,
+            "objective": self.objective,
+            "plan_step_id": self.plan_step_id,
+            "verification": self.verification,
+            "recovery": self.recovery,
         }
 
 
@@ -86,6 +101,11 @@ class AgentState:
     task_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     started: float = field(default_factory=time.time)
     finished: float = None
+    intent: object = None
+    profile: str = "direct"
+    plan: object = None
+    context: dict = field(default_factory=dict)
+    outcome: dict = field(default_factory=dict)
 
     def add_step(self, step):
         self.steps.append(step)
@@ -103,11 +123,17 @@ class AgentState:
         return all(step.status is StepStatus.SUCCEEDED for step in self.steps)
 
     @property
+    def partially_completed(self):
+        return any(step.status is StepStatus.SUCCEEDED for step in self.steps) and not self.verified
+
+    @property
     def duration_seconds(self):
         end = self.finished if self.finished is not None else time.time()
         return round(end - self.started, 3)
 
     def to_dict(self):
+        plan = self.plan.to_dict() if hasattr(self.plan, "to_dict") else None
+        intent = self.intent.to_dict() if hasattr(self.intent, "to_dict") else None
         return {
             "task_id": self.task_id,
             "task": self.task,
@@ -117,6 +143,12 @@ class AgentState:
             "final_answer": self.final_answer,
             "error": self.error,
             "verified": self.verified,
+            "partially_completed": self.partially_completed,
             "duration_seconds": self.duration_seconds,
+            "profile": self.profile,
+            "intent": intent,
+            "plan": plan,
+            "context": self.context,
+            "outcome": self.outcome,
             "steps": [step.to_dict() for step in self.steps],
         }

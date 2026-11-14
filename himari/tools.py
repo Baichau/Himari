@@ -36,11 +36,12 @@ def _perm(key):
     return bool(permissions.get(key, False))
 
 
-def _file_path(path):
+def _file_path(path, allow_workspaces=False):
     if path is None:
         raise PermissionError("No path provided.")
 
-    requested = Path(os.path.expandvars(os.path.expanduser(str(path)))).resolve(strict=False)
+    raw = os.path.expandvars(os.path.expanduser(str(path)))
+    requested = Path(raw).resolve(strict=False)
     config = load()
     permissions = config.get("permissions", {}) if isinstance(config, dict) else {}
     allowed_folders = permissions.get("allowed_folders", [])
@@ -54,9 +55,26 @@ def _file_path(path):
             continue
         root = Path(os.path.expandvars(os.path.expanduser(str(folder)))).resolve(strict=False)
         roots.append(root)
+    if allow_workspaces:
+        try:
+            from .development import active_project, discover_workspaces
+
+            if not Path(raw).is_absolute():
+                project = active_project()
+                if project is not None:
+                    requested = (project / raw).resolve(strict=False)
+            roots.extend(discover_workspaces())
+        except Exception as exc:
+            log.debug("Development workspaces unavailable for file access: %s", exc)
 
     if not any(requested == root or requested.is_relative_to(root) for root in roots):
-        raise PermissionError("This path is outside the configured allowed folders.")
+        if not allow_workspaces:
+            raise PermissionError("This path is outside the configured allowed folders.")
+        hint = " Open a project first or give an absolute path." if not Path(raw).is_absolute() else ""
+        raise PermissionError(
+            "This path is outside the allowed folders and development "
+            f"workspaces.{hint}"
+        )
     return requested
 
 
@@ -442,29 +460,196 @@ def close_app(name):
 
 
 
-def play_music(query):
+def play_music(query, artist=None):
+    """Play one specific track in Spotify and verify it is actually playing."""
     if not _perm("allow_open_app"):
-        return "Permission denied: open_app"
-    query = query.strip()
-    if not query:
-        return "Tell me the song or artist to search for."
-    spotify_uri = f"spotify:search:{quote(query)}"
-    if _open_protocol(spotify_uri):
-        return (
-            f"Opened Spotify search for '{query}'. Himari cannot choose or start "
-            "a track; select a result in Spotify. media_control only affects "
-            "whatever is already playing."
-        )
-    url = f"https://open.spotify.com/search/{quote(query)}"
+        return {"ok": False, "error": "Permission denied: open_app"}
+    query = str(query or "").strip()
+    artist = str(artist or "").strip()
+    if not query and not artist:
+        return {"ok": False, "error": "Tell me the song or artist to play."}
     try:
-        return (
-            f"Opened Spotify search for '{query}'. Himari cannot choose or start "
-            "a track; select a result to start playback."
-            if webbrowser.open(url)
-            else "Could not open Spotify. You can try opening it from the Start Menu."
+        from .applications import spotify
+    except Exception as exc:
+        return {"ok": False, "error": f"Spotify support is unavailable: {exc}"}
+    try:
+        return spotify.play(query, artist=artist or None)
+    except spotify.SpotifyError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Spotify playback failed: {exc}"}
+
+
+def spotify_search(query, artist=None, limit=5):
+    """Resolve exact Spotify tracks through the Web API (read-only)."""
+    query = str(query or "").strip()
+    artist = str(artist or "").strip()
+    if not query and not artist:
+        return {"ok": False, "error": "Tell me which song or artist to look for."}
+    try:
+        from .applications import spotify
+    except Exception as exc:
+        return {"ok": False, "error": f"Spotify support is unavailable: {exc}"}
+    try:
+        if not spotify.status().get("api_ready"):
+            return {
+                "ok": False,
+                "error": (
+                    "Spotify API credentials are not configured, so exact track "
+                    "search is unavailable. Add them in Settings."
+                ),
+            }
+        tracks = spotify.search_tracks(query, artist=artist or None, limit=limit)
+    except spotify.SpotifyError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Spotify search failed: {exc}"}
+    if not tracks:
+        return {
+            "ok": False,
+            "error": f"Spotify did not return a track for '{query or artist}'.",
+        }
+    return {
+        "ok": True,
+        "query": query or artist,
+        "tracks": [track.to_dict() for track in tracks],
+    }
+
+
+def now_playing():
+    """Read the active Windows media session."""
+    try:
+        from .windows import media_session
+    except Exception as exc:
+        return {"ok": False, "error": f"Media session support is unavailable: {exc}"}
+    try:
+        observed = media_session.now_playing()
+    except media_session.MediaSessionError as exc:
+        return {"ok": False, "error": str(exc)}
+    if observed is None:
+        return {"ok": False, "error": "No active media session was found."}
+    return {"ok": True, **observed.to_dict()}
+
+
+def weather_forecast(location=None, days=3):
+    """Live forecast through Open-Meteo; never answers weather from memory."""
+    try:
+        from .applications import weather
+    except Exception as exc:
+        return {"ok": False, "error": f"Weather support is unavailable: {exc}"}
+    try:
+        data = weather.forecast(
+            days=days, location=str(location or "").strip() or None
         )
-    except Exception as e:
-        return f"Could not open Spotify: {e}"
+    except weather.WeatherError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Weather lookup failed: {exc}"}
+    data = dict(data)
+    data["formatted"] = weather.format_forecast(data, days=days)
+    return data
+
+
+def calendar_list(days=7, start=None, end=None):
+    try:
+        from .applications import calendar
+    except Exception as exc:
+        return {"ok": False, "error": f"Calendar support is unavailable: {exc}"}
+    try:
+        events = calendar.list_events(
+            days=days, start=start or None, end=end or None
+        )
+    except calendar.CalendarError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read the calendar: {exc}"}
+    return {
+        "ok": True,
+        "count": len(events),
+        "events": [event.to_dict() for event in events],
+    }
+
+
+def calendar_create(title, start, duration_minutes=60, location="", notes="", attendees=""):
+    try:
+        from .applications import calendar
+    except Exception as exc:
+        return {"ok": False, "error": f"Calendar support is unavailable: {exc}"}
+    try:
+        result = calendar.create_event(
+            title,
+            start,
+            duration_minutes=duration_minutes,
+            location=location,
+            notes=notes,
+            attendees=attendees,
+        )
+    except calendar.CalendarError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not create the event: {exc}"}
+    return {
+        "ok": True,
+        "event": result["event"],
+        "conflicts": result.get("conflicts") or [],
+    }
+
+
+def calendar_delete(event_id):
+    try:
+        from .applications import calendar
+    except Exception as exc:
+        return {"ok": False, "error": f"Calendar support is unavailable: {exc}"}
+    try:
+        result = calendar.delete_event(event_id)
+    except calendar.CalendarError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not delete the event: {exc}"}
+    return {"ok": True, "event": result["deleted"], "deleted": True}
+
+
+def calendar_export(path=None):
+    try:
+        from .applications import calendar
+    except Exception as exc:
+        return {"ok": False, "error": f"Calendar support is unavailable: {exc}"}
+    try:
+        result = calendar.export_ics(path)
+    except calendar.CalendarError as exc:
+        return {"ok": False, "error": str(exc)}
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not write the calendar export: {exc}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not export the calendar: {exc}"}
+    return {"ok": True, **result}
+
+
+def app_registry_tool(query="", limit=25):
+    """Search the installed-app registry with running state and support level."""
+    try:
+        from .applications import discovery
+    except Exception as exc:
+        return {"ok": False, "error": f"App discovery is unavailable: {exc}"}
+    try:
+        return discovery.list_apps(query=query, limit=limit)
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not read the installed-app registry: {exc}"}
+
+
+def inspect_app(name):
+    """Describe one installed app: target, running state, windows, support level."""
+    if not isinstance(name, str) or not name.strip():
+        return {"ok": False, "error": "Tell me which application to inspect."}
+    try:
+        from .applications import discovery
+    except Exception as exc:
+        return {"ok": False, "error": f"App discovery is unavailable: {exc}"}
+    try:
+        return discovery.describe(name.strip())
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not inspect '{name.strip()}': {exc}"}
+
 
 
 def _steam_games():
@@ -542,13 +727,13 @@ def read_file(path):
     if not _perm("allow_read_file"):
         return "Permission denied: read_file"
     try:
-        path = _file_path(path)
+        path = _file_path(path, allow_workspaces=True)
         if not path.is_file():
             return f"File not found: {path}"
-        if path.stat().st_size > 200_000:
+        if path.stat().st_size > 400_000:
             return "File too large to read safely."
         with path.open(encoding="utf-8", errors="replace") as f:
-            return f.read()[:20_000]
+            return f"Contents of {path}:\n\n" + f.read()[:40_000]
     except (OSError, PermissionError) as e:
         return f"Failed: {e}"
 
@@ -1011,6 +1196,12 @@ def open_project(name, create=False):
         return str(exc)
     except OSError as exc:
         return f"Could not open {folder.name} in Visual Studio Code: {exc}"
+    try:
+        from .development import set_active_project
+
+        set_active_project(folder)
+    except Exception as exc:
+        log.debug("Could not remember the active project: %s", exc)
     return _verified_open_message(
         folder.name,
         before,
@@ -1668,6 +1859,43 @@ def find_video(query, limit=3):
     return "\n".join(lines)
 
 
+def open_video(query, index=1):
+    """Search YouTube and open one matching watch page in the default browser."""
+    if not _perm("allow_open_url"):
+        return "Permission denied: opening websites is disabled in Settings."
+    if not _perm("allow_web_research"):
+        return "Permission denied: web research is disabled in Settings."
+    query, error = _search_query(query)
+    if error:
+        return error
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return "Video number must be a whole number."
+    if index < 1 or index > 5:
+        return "Choose a video number from 1 to 5."
+    from .youtube import search_videos
+
+    videos, error = search_videos(query, index)
+    if error:
+        return error
+    if index > len(videos):
+        return f"YouTube returned {len(videos)} readable video(s); video {index} does not exist."
+    chosen = videos[index - 1]
+    outcome = open_url(chosen["url"])
+    if not outcome.startswith("Opened"):
+        return outcome
+    details = " · ".join(
+        part for part in (chosen.get("channel"), chosen.get("duration")) if part
+    )
+    suffix = f" ({details})" if details else ""
+    return (
+        f'Opened video {index} of {len(videos)} in your default browser: '
+        f'"{chosen["title"]}"{suffix} — {chosen["url"]}. The watch page is open; '
+        "playback is not verified, so do not claim the video is playing."
+    )
+
+
 BROWSER_TAB_ACTIONS = ("list", "focus", "close", "close_others", "close_all")
 
 
@@ -1868,16 +2096,60 @@ def browser_close():
     return _browser_outcome(outcome, "Closed Himari's browser window.")
 
 
-def list_project_files(path, max_files=100):
+def search_code(path="", query=""):
+    """Search text inside a configured project workspace. Read-only."""
+    if not _perm("allow_read_file"):
+        return "Permission denied: reading files is disabled in Settings."
+    query = str(query or "").strip()
+    if not query:
+        return "Tell me what text, function, or symbol to search for."
+    from .development import (
+        WorkspaceError,
+        active_project,
+        search_code as _search,
+        workspace_for,
+    )
+
+    requested = str(path or "").strip()
+    if requested:
+        try:
+            target = _file_path(requested, allow_workspaces=True)
+        except PermissionError as exc:
+            return f"Could not search there: {exc}"
+    else:
+        target = active_project()
+        if target is None:
+            return (
+                "No project is open yet. Open one with open_project first, or "
+                "name the project folder."
+            )
+    try:
+        workspace_for(target)
+    except WorkspaceError:
+        return "Code search only works inside folders configured as development workspaces."
+    try:
+        results = _search(str(target), query, max_results=60)
+    except WorkspaceError as exc:
+        return str(exc)
+    if not results:
+        return f"No matches for '{query}' in {target}."
+    lines = [f"Matches for '{query}' in {target}:"]
+    for item in results[:40]:
+        lines.append(f"{item['path']}:{item['line']}: {item['text']}")
+    if len(results) > 40:
+        lines.append(f"…and {len(results) - 40} more matches.")
+    return "\n".join(lines)
+
+
+def list_project_files(path=".", max_files=100):
     if not _perm("allow_read_file"):
         return "Permission denied: read_file"
-    root = Path(os.path.expandvars(os.path.expanduser(str(path)))).resolve(strict=False)
-    if not root.exists() or not root.is_dir():
-        return f"Project path not found: {path}"
     try:
-        _file_path(str(root))
-    except PermissionError:
-        return "This project path is outside the configured allowed folders."
+        root = _file_path(path, allow_workspaces=True)
+    except PermissionError as exc:
+        return f"Could not use that project path: {exc}"
+    if not root.exists() or not root.is_dir():
+        return f"Project path not found: {root}"
 
     ignore = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", ".pytest_cache", ".mypy_cache", ".idea"}
     matches = []
@@ -1893,6 +2165,131 @@ def list_project_files(path, max_files=100):
     return matches
 
 
+SCAN_MAX_ENTRIES = 60_000
+SCAN_DEADLINE_SECONDS = 4.0
+_SCAN_SKIP = {
+    "$recycle.bin",
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "system volume information",
+    "venv",
+}
+_SCAN_ALIASES = {
+    "download": "Downloads",
+    "downloads": "Downloads",
+    "document": "Documents",
+    "documents": "Documents",
+    "desktop": "Desktop",
+}
+
+
+def _human_size(value):
+    size = float(max(0, value))
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def _scan_root(path):
+    raw = str(path or "Downloads").strip().strip('"')
+    known = _SCAN_ALIASES.get(raw.casefold())
+    if known:
+        base = Path.home() / known
+        try:
+            base = _file_path(str(base))
+        except PermissionError:
+            return None, (
+                f"I can only scan folders allowed in Settings; {base} is outside them."
+            )
+    else:
+        try:
+            base = _file_path(raw, allow_workspaces=True)
+        except PermissionError as exc:
+            return None, (
+                f"I can only scan allowed folders and your configured project "
+                f"workspaces: {exc}"
+            )
+    base = base.resolve(strict=False)
+    if not base.is_dir():
+        return None, f"Folder not found: {base}"
+    return base, None
+
+
+def scan_large_files(path="Downloads", limit=20):
+    """Report the largest files and folders inside one allowed folder. Read-only."""
+    if not _perm("allow_read_file"):
+        return "Permission denied: reading files is disabled in Settings."
+    root, error = _scan_root(path)
+    if error:
+        return error
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        return "Tell me how many results to list (a whole number)."
+    limit = max(5, min(limit, 50))
+
+    started = time.monotonic()
+    files = []
+    folder_totals = {}
+    scanned = 0
+    truncated = False
+    for current, dirs, names in os.walk(root, followlinks=False):
+        dirs[:] = [
+            name
+            for name in dirs
+            if name.casefold() not in _SCAN_SKIP and not name.startswith(".")
+        ]
+        if time.monotonic() - started > SCAN_DEADLINE_SECONDS or scanned >= SCAN_MAX_ENTRIES:
+            truncated = True
+            break
+        current_path = Path(current)
+        try:
+            relative = current_path.relative_to(root)
+        except ValueError:
+            continue
+        top = relative.parts[0] if relative.parts else ""
+        for name in names:
+            entry = current_path / name
+            try:
+                if entry.is_symlink():
+                    continue
+                size = entry.stat().st_size
+            except OSError:
+                continue
+            scanned += 1
+            if top:
+                folder_totals[top] = folder_totals.get(top, 0) + size
+            files.append((size, entry))
+
+    files.sort(key=lambda item: item[0], reverse=True)
+    folders = sorted(folder_totals.items(), key=lambda item: item[1], reverse=True)
+    lines = [f"Largest items in {root}"]
+    if folders:
+        lines.append("Folders (total size):")
+        for position, (name, size) in enumerate(folders[:limit], start=1):
+            lines.append(f"{position}. {_human_size(size)}  {name}{os.sep}")
+    if files:
+        lines.append("Files:")
+        for position, (size, entry) in enumerate(files[:limit], start=1):
+            try:
+                label = str(entry.relative_to(root))
+            except ValueError:
+                label = str(entry)
+            lines.append(f"{position}. {_human_size(size)}  {label}")
+    lines.append(
+        f"Scanned {scanned:,} files"
+        + (" (stopped early because the folder is very large)" if truncated else "")
+        + ". Nothing was deleted, moved, or opened."
+    )
+    return "\n".join(lines)
+
+
 TOOLS = [
     {"name": "open_app", "confirm": False, "spec": {"type": "function", "function": {
         "name": "open_app", "description": "Open a Windows app by its Start Menu name, a common app alias (browser, Spotify, Steam, Minecraft), or a full path. If the app is already running, focuses its existing window instead of opening a duplicate.",
@@ -1902,13 +2299,92 @@ TOOLS = [
         "name": "launch_game", "description": "Launch an installed Steam game by its exact library title, or open a game launcher by its Start Menu name.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
      "fn": launch_game},
-    {"name": "play_music", "confirm": False, "spec": {"type": "function", "function": {
+    {"name": "play_music", "confirm": False, "timeout_seconds": 60, "spec": {"type": "function", "function": {
         "name": "play_music",
-        "description": "Open Spotify search for a song or artist. This does not choose or start a track: never say the requested song is playing. The user picks the result in Spotify; media_control only affects whatever is already playing.",
-        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+        "description": "Play one specific song in Spotify, bring Spotify to the front, and verify that the track is really playing through the Windows media session. Resolves an exact track link with the Spotify API when credentials are configured, otherwise through public track search, and only then falls back to focused search. Always call this when the user asks to play a song; never answer with a promise. Only report success when the result says playback was verified; otherwise report the exact failure. Pass artist as well when the user named a performer.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Song title, or an artist name when only an artist was given."},
+            "artist": {"type": "string", "description": "Optional performer to disambiguate remixes and covers."},
+        }, "required": ["query"]}}},
      "fn": play_music},
+    {"name": "spotify_search", "confirm": False, "timeout_seconds": 30, "spec": {"type": "function", "function": {
+        "name": "spotify_search",
+        "description": "Search Spotify for exact tracks and return titles, artists and albums, best match first. Read-only; it opens nothing and plays nothing. Requires Spotify API credentials in Settings.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string"},
+            "artist": {"type": "string"},
+            "limit": {"type": "integer", "description": "How many candidates to return, 1 to 20; default 5."},
+        }, "required": ["query"]}}},
+     "fn": spotify_search},
+    {"name": "now_playing", "confirm": False, "timeout_seconds": 15, "spec": {"type": "function", "function": {
+        "name": "now_playing",
+        "description": "Read the active Windows media session and report the current track, app and whether it is playing or paused. Use it to answer 'what is playing' or to check playback before claiming a song is on.",
+        "parameters": {"type": "object", "properties": {}}}},
+     "fn": now_playing},
+    {"name": "weather_forecast", "confirm": False, "timeout_seconds": 45, "spec": {"type": "function", "function": {
+        "name": "weather_forecast",
+        "description": "Fetch a live weather forecast from Open-Meteo, including current conditions and daily highs, lows and rain chance. Always call this instead of answering weather from memory. Omit location to use the configured city, or pass a city name.",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "string", "description": "City or place name; omit to use the configured location."},
+            "days": {"type": "integer", "description": "Forecast days, 1 to 14; default 3."},
+        }}}},
+     "fn": weather_forecast},
+    {"name": "calendar_list", "confirm": False, "spec": {"type": "function", "function": {
+        "name": "calendar_list",
+        "description": "List events from Himari's local calendar between two dates, or from now for the next N days. Read-only.",
+        "parameters": {"type": "object", "properties": {
+            "days": {"type": "integer", "description": "How many days ahead to look when start/end are omitted; default 7."},
+            "start": {"type": "string", "description": "Optional start such as 'tomorrow' or 2026-11-14."},
+            "end": {"type": "string", "description": "Optional end date."},
+        }}}},
+     "fn": calendar_list},
+    {"name": "calendar_create", "confirm": True,
+     "confirm_message": "Allow Himari to create this event in your local calendar?",
+     "spec": {"type": "function", "function": {
+         "name": "calendar_create",
+         "description": "Create one event in Himari's local calendar and return its id. Interpret relative dates before calling; the start must include a time. Events are stored only on this PC.",
+         "parameters": {"type": "object", "properties": {
+             "title": {"type": "string"},
+             "start": {"type": "string", "description": "Start such as 'tomorrow at 12:00' or 2026-11-14T12:00."},
+             "duration_minutes": {"type": "integer", "description": "Duration in minutes; default 60."},
+             "location": {"type": "string"},
+             "notes": {"type": "string"},
+             "attendees": {"type": "string"},
+         }, "required": ["title", "start"]}}},
+     "fn": calendar_create},
+    {"name": "calendar_delete", "confirm": True,
+     "confirm_message": "Allow Himari to delete this event from your local calendar?",
+     "spec": {"type": "function", "function": {
+         "name": "calendar_delete",
+         "description": "Delete one event from Himari's local calendar by its id. Use calendar_list first so the id is real.",
+         "parameters": {"type": "object", "properties": {
+             "event_id": {"type": "string", "description": "Event id from calendar_list."},
+         }, "required": ["event_id"]}}},
+     "fn": calendar_delete},
+    {"name": "calendar_export", "confirm": False, "spec": {"type": "function", "function": {
+        "name": "calendar_export",
+        "description": "Export every local calendar event to a standard .ics file and return the file path. Writes inside Himari's own data folder unless a path is given.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Optional destination path for the .ics file."},
+        }}}},
+     "fn": calendar_export},
+    {"name": "app_registry", "confirm": False, "timeout_seconds": 45, "spec": {"type": "function", "function": {
+        "name": "app_registry",
+        "description": "Search every application Windows knows about (Start Menu, registry, Store) with alias resolution, running state, open windows and an honest support level. Read-only; use it before claiming an app is installed or controllable.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Optional name or alias; empty lists running apps first."},
+            "limit": {"type": "integer", "description": "Maximum results, 1 to 100; default 25."},
+        }}}},
+     "fn": app_registry_tool},
+    {"name": "inspect_app", "confirm": False, "timeout_seconds": 45, "spec": {"type": "function", "function": {
+        "name": "inspect_app",
+        "description": "Describe one installed app: launch target, source, running state, visible windows and support level (discovered, launchable, inspectable, interactable, integrated). Read-only.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "App name or common alias."},
+        }, "required": ["name"]}}},
+     "fn": inspect_app},
     {"name": "open_url", "confirm": False, "spec": {"type": "function", "function": {
-        "name": "open_url", "description": "Open a website URL in the user's default browser. Does not manage or close tabs.",
+        "name": "open_url", "description": "Open a website URL in the user's own signed-in default browser. Prefer this for every normal open/watch/play request. Does not manage or close tabs.",
         "parameters": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]}}},
      "fn": open_url},
     {"name": "search_web", "confirm": False, "spec": {"type": "function", "function": {
@@ -1917,7 +2393,7 @@ TOOLS = [
      "fn": search_web},
     {"name": "open_first_result", "confirm": False, "spec": {"type": "function", "function": {
         "name": "open_first_result",
-        "description": "Search the web and open one numbered result (default the first) in the user's default browser. Use whenever the user asks to open the first, top, or Nth link/result. Never open another search page instead.",
+        "description": "Search the web and open one numbered result (default the first) in the user's own signed-in default browser. Preferred for 'open the first/top/Nth link' requests. Never open another search page instead.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"},
             "index": {"type": "integer", "description": "1-based result number; default 1."},
@@ -1925,7 +2401,7 @@ TOOLS = [
      "fn": open_first_result},
     {"name": "browser_open", "confirm": False, "timeout_seconds": 90, "spec": {"type": "function", "function": {
         "name": "browser_open",
-        "description": "Open one page in Himari's own visible Chrome window and keep it open for tab control. Use it once per request, only when the user asked to open, show, watch, or play something. Pass new_tab=false to reuse the current tab instead of adding one. This is a separate window with an isolated profile, so the user's saved logins are unavailable, and the user's everyday Chrome tabs are never touched.",
+        "description": "Open one page in Himari's own visible Chrome window. Use only when the user explicitly asks for Himari's own browser or to control its tabs; for ordinary open/show/watch/play requests use open_url so the user stays signed in. This window has an isolated profile with no saved logins. Pass new_tab=false to reuse the current tab.",
         "parameters": {"type": "object", "properties": {
             "url": {"type": "string"},
             "new_tab": {"type": "boolean", "description": "Open in a new tab (default true). Use false to replace the current tab."},
@@ -1940,7 +2416,7 @@ TOOLS = [
      "fn": browser_search},
     {"name": "browser_open_result", "confirm": False, "timeout_seconds": 90, "spec": {"type": "function", "function": {
         "name": "browser_open_result",
-        "description": "Open one numbered DuckDuckGo result in Himari's own browser window. By default it reuses the current tab, replacing the search page, so one request ends with one page. Set new_tab=true only when the user explicitly wants an extra tab.",
+        "description": "Open one numbered DuckDuckGo result in Himari's own browser window. Only for requests that explicitly target Himari's browser or its tabs; otherwise use open_first_result for the user's signed-in browser. By default it reuses the current tab, replacing the search page.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"},
             "index": {"type": "integer", "description": "1-based result number; default 1."},
@@ -1972,13 +2448,22 @@ TOOLS = [
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
      "fn": research_web},
     {"name": "search_youtube", "confirm": False, "spec": {"type": "function", "function": {
-        "name": "search_youtube", "description": "Open YouTube search results in the user's default browser. This shows a list, not the video. When the user wants a specific video opened or played, call find_video first and open the one chosen watch URL instead.",
+        "name": "search_youtube", "description": "Open YouTube search results in the user's default browser. This shows a list, not the video. For 'play/open the first video' use open_video instead; it opens one watch page directly.",
         "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
      "fn": search_youtube},
+    {"name": "open_video", "confirm": False, "timeout_seconds": 30,
+     "spec": {"type": "function", "function": {
+        "name": "open_video",
+        "description": "Search YouTube and open exactly one video (default the first) in the user's default browser. Use this for every 'play/open/watch the first video' or named video request; play_music is only for songs in Spotify. It opens the watch page and does not verify playback.",
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "What the video is about, such as 'fireplace video'."},
+            "index": {"type": "integer", "description": "1-based video number; default 1 (the first result)."},
+        }, "required": ["query"]}}},
+     "fn": open_video},
     {"name": "find_video", "confirm": False, "silent": True, "timeout_seconds": 30,
      "spec": {"type": "function", "function": {
         "name": "find_video",
-        "description": "Quietly look up YouTube videos in the background and return titles, channels, durations, and watch URLs without opening a browser. Use it before opening or playing a video the user asked for, then open exactly one chosen watch URL once. It does not play anything.",
+        "description": "Quietly look up YouTube videos in the background and return titles, channels, durations, and watch URLs without opening a browser. Use it only when the user wants to choose from several; when they asked for a video to watch, call open_video instead.",
         "parameters": {"type": "object", "properties": {
             "query": {"type": "string"},
             "limit": {"type": "integer", "description": "How many candidates to return, 1 to 5; default 3."},
@@ -2015,18 +2500,40 @@ TOOLS = [
     },
     {"name": "list_project_files", "confirm": True, "confirm_message": "Allow Himari to inspect this project folder?",
      "spec": {"type": "function", "function": {
-         "name": "list_project_files", "description": "List project files while ignoring common build/cache folders.",
-         "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "max_files": {"type": "integer"}}, "required": ["path"]}}},
+         "name": "list_project_files",
+         "description": "List project files while ignoring common build/cache folders. Defaults to the project opened with open_project; a relative path resolves inside it, and configured development workspaces are allowed.",
+         "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Project folder; omit for the opened project."}, "max_files": {"type": "integer"}}, "required": []}}},
      "fn": list_project_files},
+    {"name": "search_code", "confirm": True, "timeout_seconds": 60,
+     "confirm_message": "Allow Himari to search this project for that text?",
+     "spec": {"type": "function", "function": {
+         "name": "search_code",
+         "description": "Search project source files for a function, symbol, or phrase and return file, line and matching text. Defaults to the project opened with open_project. Read-only.",
+         "parameters": {"type": "object", "properties": {
+             "path": {"type": "string", "description": "Project folder; omit for the opened project."},
+             "query": {"type": "string", "description": "Text, symbol, or phrase to find."},
+         }, "required": ["query"]}}},
+     "fn": search_code},
     {"name": "set_volume", "confirm": False, "spec": {"type": "function", "function": {
         "name": "set_volume", "description": "Set system volume from 0 to 100.",
         "parameters": {"type": "object", "properties": {"percent": {"type": "integer"}}, "required": ["percent"]}}},
      "fn": set_volume},
     {"name": "read_file", "confirm": True, "confirm_message": "Allow Himari to read this file?",
      "spec": {"type": "function", "function": {
-         "name": "read_file", "description": "Read a text file the user specified.",
+         "name": "read_file",
+         "description": "Read one text file the user named. Relative paths resolve against the project opened with open_project; configured development workspaces and allowed folders are permitted. Use it to answer questions about real file contents; use scan_large_files for disk usage.",
          "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
      "fn": read_file},
+    {"name": "scan_large_files", "confirm": True, "timeout_seconds": 20,
+     "confirm_message": "Allow Himari to check folder and file sizes in this folder? Nothing will be deleted.",
+     "spec": {"type": "function", "function": {
+        "name": "scan_large_files",
+        "description": "Read-only disk scan: report the largest files and subfolders inside one allowed folder (Downloads or Documents by default) with real sizes. Use it when the user asks what is taking up space or to find large files; it deletes and opens nothing.",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Folder to scan such as Downloads, Documents, or a full path inside the allowed folders."},
+            "limit": {"type": "integer", "description": "How many entries to list per group, 5 to 50; default 20."},
+        }}}},
+     "fn": scan_large_files},
     {"name": "write_file", "confirm": True, "confirm_message": "Allow Himari to write this file?",
      "spec": {"type": "function", "function": {
          "name": "write_file", "description": "Write text to a file inside a folder explicitly allowed in Settings. For a Desktop .txt file, use write_desktop_file.",
@@ -2223,3 +2730,7 @@ TOOLS = [
     },
 
 ]
+
+from .skills import skill_tools as _skill_tools  # noqa: E402  (needs TOOLS defined)
+
+TOOLS.extend(_skill_tools())

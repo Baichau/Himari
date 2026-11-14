@@ -1,12 +1,106 @@
 {
-  "ollama": {"host":"http://127.0.0.1:11434","chat_model":"qwen3:8b","vision_model":"qwen2.5vl:3b","vision_timeout_seconds":300,"temperature":0.7,"timeout_seconds":180,"stream_timeout_seconds":900,"keep_alive":"30m","preload_model":true,"deep_reasoning":true,"context_window":8192},
-  "voice": {"stt_model":"large-v3-turbo","tts_voice":"en_US-amy-medium","volume":1.0,"speak_replies":true,"push_to_talk_key":"f9","language":"en","recognition_language":"auto","wake_word_enabled":false,"wake_word":"Himari","microphone_device":null,"output_device":null,"sensitivity":0.75},
-  "screen": {"monitor":"primary","capture_hotkey":"f10"},
-  "research": {"searx_url":""},
-  "memory": {"embedding_model":""},
-  "privacy": {"store_conversations":true,"auto_memory":true,"memory_enabled":true},
-  "development": {"workspaces":[]},
-  "personality": {"name":"Himari","playfulness":"medium","roleplay":"minimal"},
-  "permissions": {"allow_open_app":true,"allow_open_url":true,"allow_web_research":true,"allow_vision":true,"allow_volume":true,"allow_read_file":true,"allow_screen_capture":true,"allow_screen_control":false,"allow_active_window":false,"allow_media_control":false,"allow_run_command":false,"allow_write_file":false,"allow_browser_automation":false,"allowed_folders":["~/Documents","~/Downloads"]},
-  "ui": {"theme":"dark","font_size":14,"always_on_top":false,"minimize_to_tray":true,"chat_engine":"web"}
+  "ollama": {
+    "host": "http://127.0.0.1:11434",
+    "chat_model": "qwen3:8b",
+    "vision_model": "qwen2.5vl:3b",
+    "vision_timeout_seconds": 300,
+    "temperature": 0.7,
+    "timeout_seconds": 180,
+    "stream_timeout_seconds": 900,
+    "keep_alive": "30m",
+    "preload_model": true,
+    "deep_reasoning": true,
+    "context_window": 8192
+  },
+  "voice": {
+    "stt_model": "large-v3-turbo",
+    "tts_voice": "en_US-amy-medium",
+    "volume": 1.0,
+    "speak_replies": true,
+    "push_to_talk_key": "f9",
+    "language": "en",
+    "recognition_language": "auto",
+    "wake_word_enabled": false,
+    "wake_word": "Himari",
+    "microphone_device": null,
+    "output_device": null,
+    "sensitivity": 0.75
+  },
+  "screen": {
+    "monitor": "primary",
+    "capture_hotkey": "f10",
+    "watch_interval_seconds": 20,
+    "watch_max_minutes": 30
+  },
+  "research": {
+    "searx_url": ""
+  },
+  "spotify": {
+    "client_id": "",
+    "client_secret": ""
+  },
+  "location": {
+    "city": "",
+    "latitude": null,
+    "longitude": null,
+    "units": "metric",
+    "auto_detect": true
+  },
+  "reasoning": {
+    "profile": "auto",
+    "auto_escalate": true,
+    "max_rounds": 12
+  },
+  "calendar": {
+    "default_duration_minutes": 60
+  },
+  "memory": {
+    "embedding_model": ""
+  },
+  "privacy": {
+    "store_conversations": true,
+    "auto_memory": true,
+    "memory_enabled": true
+  },
+  "development": {
+    "workspaces": []
+  },
+  "personality": {
+    "name": "Himari",
+    "playfulness": "high",
+    "roleplay": "moderate"
+  },
+  "permissions": {
+    "allow_open_app": true,
+    "allow_open_url": true,
+    "allow_web_research": true,
+    "allow_vision": true,
+    "allow_volume": true,
+    "allow_read_file": true,
+    "allow_screen_capture": true,
+    "allow_screen_control": false,
+    "allow_active_window": false,
+    "allow_media_control": false,
+    "allow_run_command": false,
+    "allow_write_file": false,
+    "allow_browser_automation": false,
+    "allowed_folders": [
+      "~/Documents",
+      "~/Downloads"
+    ],
+    "allow_watch_mode": false,
+    "allow_system_diagnostics": false,
+    "allow_vscode_state": false,
+    "allow_run_tests": false
+  },
+  "ui": {
+    "theme": "dark",
+    "font_size": 14,
+    "always_on_top": false,
+    "minimize_to_tray": true,
+    "chat_engine": "web"
+  },
+  "coach": {
+    "completed": []
+  }
 }

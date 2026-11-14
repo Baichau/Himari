@@ -1,8 +1,8 @@
-import json, logging, time, ollama
+import json, logging, re, time, ollama
 from .config import load
 from . import db
 from .tool_exec import ToolTimeoutError, call as call_tool, timeout_for
-from .tool_results import classify_result
+from .tool_results import as_text, classify_result
 log=logging.getLogger("himari.llm")
 MAX_TOOL_ROUNDS=5
 MAX_START_RETRIES=2
@@ -32,6 +32,73 @@ def _is_missing_model(message):
 def _is_transient(message):
     text = message.lower()
     return any(term in text for term in _TRANSIENT_ERRORS)
+
+
+_THINK_TAGS = ("<think", "<thinking", "</think", "</thinking")
+_THINK_OPEN = re.compile(r"<(?:think|thinking)\b[^>]*>", re.I)
+_THINK_CLOSE = re.compile(r"</(?:think|thinking)\s*>", re.I)
+_THINK_ANY = re.compile(r"</?(?:think|thinking)\b[^>]*>", re.I)
+_THINK_PAIR = re.compile(
+    r"<(?:think|thinking)\b[^>]*>.*?</(?:think|thinking)\s*>",
+    re.S | re.I,
+)
+
+
+def _partial_tag(text):
+    """Longest suffix that could still grow into a reasoning tag."""
+    lowered = text.casefold()
+    for size in range(min(len(lowered), 12), 0, -1):
+        suffix = lowered[-size:]
+        if any(tag.startswith(suffix) for tag in _THINK_TAGS):
+            return text[-size:]
+    return ""
+
+
+class _VisibleText:
+    """Suppress leaked reasoning blocks while the reply streams."""
+
+    _HOLD = 16
+
+    def __init__(self):
+        self._buffer = ""
+        self._in_think = False
+
+    def feed(self, chunk):
+        if not chunk:
+            return ""
+        self._buffer += str(chunk)
+        visible = []
+        while self._buffer:
+            if self._in_think:
+                match = _THINK_CLOSE.search(self._buffer)
+                if match is None:
+                    self._buffer = self._buffer[-self._HOLD:]
+                    break
+                self._buffer = self._buffer[match.end():]
+                self._in_think = False
+                continue
+            match = _THINK_OPEN.search(self._buffer)
+            if match is not None:
+                visible.append(self._buffer[:match.start()])
+                self._buffer = self._buffer[match.end():]
+                self._in_think = True
+                continue
+            held = _partial_tag(self._buffer)
+            visible.append(self._buffer[:-len(held)] if held else self._buffer)
+            self._buffer = held
+            break
+        return "".join(visible)
+
+    def flush(self):
+        pending = "" if self._in_think else self._buffer
+        self._buffer = ""
+        return pending
+
+
+def strip_reasoning(text):
+    """Remove reasoning tags from text that was already collected."""
+    value = _THINK_PAIR.sub("", str(text or ""))
+    return _THINK_ANY.sub("", value).strip()
 
 
 def _validated_arguments(handler, arguments):
@@ -202,8 +269,9 @@ class LLM:
             },
         )
     def stream_chat(self, messages, on_token=None, on_tool=None, confirm=None,
-                    cancel_event=None, on_status=None, think=False):
+                    cancel_event=None, on_status=None, think=False, tools=None):
         cfg=self.cfg
+        active_tools = list(self.tools or []) if tools is None else list(tools)
         think_requested=bool(think)
         if (
             think_requested
@@ -224,9 +292,9 @@ class LLM:
                  },
                  "think":think_requested,
                  "keep_alive":cfg.get("keep_alive","30m")}
-        if self.tools and tools_supported:
-            payload["tools"]=[t["spec"] for t in self.tools]
-        elif self.tools and on_status:
+        if active_tools and tools_supported:
+            payload["tools"]=[t["spec"] for t in active_tools]
+        elif active_tools and on_status:
             on_status(
                 f"{cfg['chat_model']} does not support tool calls — "
                 "answering without desktop control."
@@ -275,14 +343,17 @@ class LLM:
                     f"Cannot reach Ollama: {e}. Make sure Ollama is running."
                 ) from e
             content=""; tool_calls=[]
+            visible=_VisibleText()
             try:
                 for chunk in stream:
                     if cancelled():
                         raise LLMCancelled(content)
                     m=chunk.message
                     if getattr(m,"content",None):
-                        content+=m.content
-                        if on_token: on_token(m.content)
+                        shown=visible.feed(m.content)
+                        if shown:
+                            content+=shown
+                            if on_token: on_token(shown)
                     if getattr(m,"tool_calls",None): tool_calls.extend(m.tool_calls)
             except LLMCancelled:
                 raise
@@ -295,11 +366,16 @@ class LLM:
                 raise LLMError(
                     f"Ollama stopped responding: {e}. Press Retry to try again."
                 ) from e
+            tail=visible.flush()
+            if tail:
+                content+=tail
+                if on_token: on_token(tail)
             if cancelled():
                 raise LLMCancelled(content)
             messages.append({"role":"assistant","content":content,"tool_calls":tool_calls or None})
             if not tool_calls:
-                if content.strip():
+                content=strip_reasoning(content)
+                if content:
                     return content
                 if not retried_empty:
                     retried_empty=True
@@ -307,9 +383,16 @@ class LLM:
                     if retry_messages is not None:
                         messages=retry_messages
                         payload["messages"]=messages
+                        reasoning_only=bool(payload.get("think"))
+                        if reasoning_only:
+                            payload["think"]=False
+                            retried_think=True
                         if on_status:
                             on_status(
-                                "The model returned an empty reply — retrying "
+                                "The model returned only hidden reasoning — "
+                                "retrying without deep thinking…"
+                                if reasoning_only
+                                else "The model returned an empty reply — retrying "
                                 "with a shorter context…"
                             )
                         if cancel_event is not None:
@@ -329,7 +412,7 @@ class LLM:
                 if cancelled():
                     raise LLMCancelled(content)
                 name=tc.function.name; args=tc.function.arguments or {}
-                handler=next((t for t in self.tools if t["name"]==name),None)
+                handler=next((t for t in active_tools if t["name"]==name),None)
                 if name == "research_web" and on_status:
                     on_status("Researching the web and reading sources…")
                 allowed=False
@@ -366,7 +449,7 @@ class LLM:
                     db.log_action(name,args,result,allowed)
                 if on_tool and not (handler and handler.get("silent", False)):
                     on_tool(name,args,result)
-                messages.append({"role":"tool","content":str(result),"tool_name":name})
+                messages.append({"role":"tool","content":as_text(result),"tool_name":name})
         raise LLMError("Tool execution stopped unexpectedly.")
     def vision(self,images,prompt,model=None):
         cfg=self.cfg

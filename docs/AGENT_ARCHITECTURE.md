@@ -1,5 +1,10 @@
 # Himari 4 — Agent Architecture
 
+> Historical snapshot from 2026-11-12. The agent has since been unified with chat through the
+> capability registry, and planning, verification and recovery were added. For the current design
+> read [AGENT_DESIGN.md](AGENT_DESIGN.md), [EXECUTION_ENGINE.md](EXECUTION_ENGINE.md) and
+> [FAILURE_RECOVERY.md](FAILURE_RECOVERY.md).
+
 ## What exists today
 
 Himari has **two execution paths**:

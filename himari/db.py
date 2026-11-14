@@ -12,14 +12,29 @@ def conn():
     CREATE TABLE IF NOT EXISTS actions(id TEXT PRIMARY KEY, tool TEXT, args TEXT, result TEXT, ts REAL, approved INTEGER);
     CREATE TABLE IF NOT EXISTS summaries(id TEXT PRIMARY KEY, session TEXT, text TEXT, created REAL);
     CREATE TABLE IF NOT EXISTS memory_vectors(memory_id TEXT, model TEXT, vector TEXT, created REAL, PRIMARY KEY(memory_id,model));
+    CREATE TABLE IF NOT EXISTS calendar_events(
+        id TEXT PRIMARY KEY, uid TEXT, title TEXT, start_ts REAL, end_ts REAL,
+        start_iso TEXT, end_iso TEXT, location TEXT, notes TEXT, attendees TEXT,
+        created REAL, updated REAL
+    );
+    CREATE TABLE IF NOT EXISTS tasks(
+        id TEXT PRIMARY KEY, objective TEXT, profile TEXT, status TEXT,
+        payload TEXT, created REAL, updated REAL
+    );
+    CREATE TABLE IF NOT EXISTS app_knowledge(
+        id TEXT PRIMARY KEY, app TEXT, kind TEXT, detail TEXT, verified INTEGER,
+        created REAL, updated REAL
+    );
     CREATE INDEX IF NOT EXISTS idx_msg_session ON messages(session,ts);
     CREATE INDEX IF NOT EXISTS idx_mem_created ON memories(created);
-    CREATE INDEX IF NOT EXISTS idx_summary_session ON summaries(session,created);""")
+    CREATE INDEX IF NOT EXISTS idx_summary_session ON summaries(session,created);
+    CREATE INDEX IF NOT EXISTS idx_calendar_start ON calendar_events(start_ts);
+    CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated);""")
     return c
 def add_message(session,role,content):
     with _lock, conn() as c:
         c.execute("INSERT INTO messages VALUES(?,?,?,?,?)",(str(uuid.uuid4()),session,role,content,time.time()))
-def history(session,limit=60,max_chars=9000):
+def history(session,limit=80,max_chars=12000):
     with _lock, conn() as c:
         rows=c.execute("SELECT role,content FROM messages WHERE session=? ORDER BY ts DESC LIMIT ?",(session,limit)).fetchall()
     kept=[]; total=0
@@ -226,7 +241,12 @@ def memory_is_sensitive(text):
     return bool(_SENSITIVE_MEMORY.search(text or ""))
 
 
-def suggest_memory(message):
+def remember_request(message):
+    """Save an explicit "remember that ..." request immediately.
+
+    The user's direct request counts as consent, so the fact is available in
+    later chats right away. Sensitive and short-lived facts are still refused.
+    """
     if not isinstance(message, str):
         return None
     match = _MEMORY_REQUEST.match(message)
@@ -240,7 +260,17 @@ def suggest_memory(message):
         or _TEMPORARY_MEMORY.search(candidate)
     ):
         return None
-    return add_memory(candidate, source="suggestion", approved=0)
+    return add_memory(candidate, source="user", approved=1)
+
+
+def approve_legacy_suggestions():
+    """Approve older explicit "remember that..." rows stored as suggestions."""
+    with _lock, conn() as c:
+        cursor = c.execute(
+            "UPDATE memories SET approved=1, source='user' "
+            "WHERE approved=0 AND source='suggestion'"
+        )
+        return cursor.rowcount
 
 
 def memory_suggestions(limit=200):
@@ -310,3 +340,46 @@ def log_action(tool,args,result,approved):
 def recent_actions(limit=50):
     with _lock, conn() as c:
         return [dict(r) for r in c.execute("SELECT * FROM actions ORDER BY ts DESC LIMIT ?",(limit,))]
+
+
+def save_task(task_id, objective, profile, status, payload):
+    now = time.time()
+    with _lock, conn() as c:
+        c.execute(
+            "INSERT INTO tasks(id,objective,profile,status,payload,created,updated) "
+            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+            "objective=excluded.objective, profile=excluded.profile, "
+            "status=excluded.status, payload=excluded.payload, updated=excluded.updated",
+            (
+                str(task_id),
+                str(objective)[:2000],
+                str(profile)[:40],
+                str(status)[:40],
+                json.dumps(payload, default=str)[:200000],
+                now,
+                now,
+            ),
+        )
+
+
+def load_task(task_id):
+    with _lock, conn() as c:
+        row = c.execute("SELECT * FROM tasks WHERE id=?", (str(task_id),)).fetchone()
+    if row is None:
+        return None
+    data = dict(row)
+    try:
+        data["payload"] = json.loads(data.get("payload") or "{}")
+    except (TypeError, ValueError):
+        data["payload"] = {}
+    return data
+
+
+def recent_tasks(limit=20):
+    with _lock, conn() as c:
+        rows = c.execute(
+            "SELECT id,objective,profile,status,created,updated FROM tasks "
+            "ORDER BY updated DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(row) for row in rows]

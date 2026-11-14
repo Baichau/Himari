@@ -83,12 +83,24 @@ def test_messages_include_attachment_chips_and_generated_images(tmp_path):
     assert picture.resolve().as_uri() in rendered
 
 
-def test_streaming_message_has_a_cursor():
+def test_streaming_message_has_a_cursor_and_typing_dots():
     rendered = chat_web.render_messages_html(
         [{"role": "assistant", "content": "thinking", "streaming": True}]
     )
 
     assert 'class="cursor"' in rendered
+    assert 'class="typing"' in rendered
+    assert rendered.count("<i></i>") == 3
+
+
+def test_only_assistant_messages_show_the_small_avatar_badge():
+    assistant = chat_web.render_message_html(
+        {"role": "assistant", "content": "Hello"}
+    )
+    user = chat_web.render_message_html({"role": "user", "content": "Hi"})
+
+    assert 'class="avatar-badge"' in assistant
+    assert 'class="avatar-badge"' not in user
 
 
 def test_tool_messages_follow_the_show_tools_flag():
@@ -324,6 +336,17 @@ def test_bundled_assets_exist():
         "himari-chat.js",
     ):
         assert (Path(assets) / relative).is_file(), relative
+
+
+def test_transcript_scroll_survives_long_restores():
+    # A long smooth scroll leaves the embedded view unpainted, which reads as
+    # an empty transcript, so big jumps must be instant and content growth must
+    # keep the pinned transcript at the bottom.
+    script = (Path(chat_web.ASSETS_DIR) / "himari-chat.js").read_text(encoding="utf-8")
+
+    assert "distance < 600" in script
+    assert "new ResizeObserver" in script
+    assert "window.scrollTo(0, document.documentElement.scrollHeight)" in script
 
 
 def test_classic_renderer_includes_attachment_names_and_image_path():

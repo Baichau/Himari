@@ -257,7 +257,11 @@ def _card(
         body += _image_card(image)
     body += attachment_chips_html(attachments)
     if streaming:
-        body += '<span class="cursor">&#9615;</span>'
+        body += (
+            '<span class="typing" aria-label="Himari is typing">'
+            "<i></i><i></i><i></i></span>"
+            '<span class="cursor">&#9615;</span>'
+        )
     stamp = _time_label(timestamp)
     stamp_html = f'<span class="time"> · {stamp}</span>' if stamp else ""
     copy_attr = f' data-copy="{html.escape(text, quote=True)}"' if text else ""
@@ -266,9 +270,17 @@ def _card(
         if text
         else ""
     )
+    if role == "assistant":
+        who_html = (
+            '<span class="who with-avatar">'
+            '<span class="avatar-badge" role="presentation">ひ</span>'
+            f"{html.escape(who)}</span>"
+        )
+    else:
+        who_html = f'<span class="who">{html.escape(who)}</span>'
     return (
         f'<article class="msg {html.escape(role)}"{copy_attr}>'
-        f'<div class="meta"><span class="who">{html.escape(who)}</span>'
+        f'<div class="meta">{who_html}'
         f"{stamp_html}{copy_button}</div>"
         f'<div class="bubble">{body}</div>'
         "</article>"
@@ -411,18 +423,30 @@ def _css(colors, font_size, theme_name="dark"):
   --text: {p['text']};
   --muted: {p['muted']};
   --border: {p['border']};
+  --border-bright: {p.get('border_bright', p['border'])};
   --accent: {p['accent']};
   --accent-strong: {p['accent_strong']};
   --accent-dim: {p['accent_dim']};
+  --accent-2: {p.get('accent_2', p['accent_strong'])};
   --code-bg: {p['code_bg']};
   --success: {p['success']};
   --warning: {p['warning']};
 }}
 * {{ box-sizing: border-box; }}
 html, body {{
-  margin: 0; padding: 0; background: {p['surface']}; color: {p['text']};
+  margin: 0; padding: 0; color: {p['text']};
   font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   font-size: {int(font_size)}px; line-height: 1.55;
+}}
+html {{
+  background: {p['surface']};
+}}
+body {{
+  background:
+    radial-gradient(1100px 520px at 12% -12%, rgba(183,156,245,.10), transparent 62%),
+    radial-gradient(900px 480px at 102% -4%, rgba(255,126,189,.09), transparent 58%),
+    linear-gradient(180deg, {p['surface']} 0%, {p['surface']} 100%);
+  min-height: 100vh;
 }}
 body {{ padding: 18px 20px 30px 20px; }}
 ::selection {{ background: {p['accent']}; color: #1b1017; }}
@@ -438,14 +462,26 @@ body {{ padding: 18px 20px 30px 20px; }}
 }}
 .meta {{ font-size: 10px; font-weight: 700; letter-spacing: .8px;
          text-transform: uppercase; color: {p['muted']};
-         margin: 0 6px 4px 6px; display: flex; align-items: center; gap: 6px; }}
+         margin: 0 6px 5px 6px; display: flex; align-items: center; gap: 6px; }}
 .meta .time {{ font-weight: 400; letter-spacing: 0; }}
-.bubble {{ padding: 12px 16px; border-radius: 14px; background: {p['assistant_bubble']};
+.who.with-avatar {{ display: inline-flex; align-items: center; gap: 7px; }}
+.avatar-badge {{
+  width: 20px; height: 20px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: radial-gradient(circle at 32% 26%, {p['accent_strong']}, {p['accent_2']} 72%);
+  color: #1b1017; font-size: 11px; font-weight: 800; letter-spacing: 0;
+  box-shadow: 0 0 0 1px {p['accent_dim']}, 0 0 12px rgba(255,126,189,.32);
+}}
+.bubble {{ padding: 12px 16px; border-radius: 15px;
+           background: linear-gradient(180deg, {p['card']}, {p['assistant_bubble']});
            border: 1px solid {p['border']}; max-width: 100%;
            overflow-wrap: anywhere;
+           box-shadow: inset 0 1px 0 rgba(255,255,255,.035);
            transition: border-color .18s ease, box-shadow .18s ease; }}
-.msg:hover .bubble {{ box-shadow: 0 5px 20px rgba(0,0,0,.16); }}
-.msg.user .bubble {{ background: {p['user_bubble']}; border-color: {p['accent_dim']};
+.msg:hover .bubble {{ border-color: {p['border_bright']};
+                      box-shadow: 0 8px 26px rgba(0,0,0,.22); }}
+.msg.user .bubble {{ background: linear-gradient(160deg, {p['user_bubble']}, {p['card_alt']});
+                     border-color: {p['accent_dim']};
                      max-width: 78%; border-bottom-right-radius: 5px; }}
 .msg.assistant .bubble {{ border-left: 3px solid {p['accent']};
                           border-bottom-left-radius: 5px; }}
@@ -544,6 +580,17 @@ pre.mermaid.mermaid-error {{ text-align: left; color: {p['warning']};
 .img-alt {{ color: {p['muted']}; font-style: italic; }}
 .cursor {{ color: {p['accent']}; animation: blink 1s steps(2, start) infinite; }}
 @keyframes blink {{ to {{ visibility: hidden; }} }}
+.typing {{ display: inline-flex; align-items: center; gap: 4px;
+  margin-left: 8px; vertical-align: middle; }}
+.typing i {{ width: 6px; height: 6px; border-radius: 50%;
+  background: {p['accent']}; opacity: .45;
+  animation: typing-dot 1.15s infinite ease-in-out; }}
+.typing i:nth-child(2) {{ animation-delay: .16s; }}
+.typing i:nth-child(3) {{ animation-delay: .32s; }}
+@keyframes typing-dot {{
+  0%, 78%, 100% {{ transform: translateY(0); opacity: .4; }}
+  35% {{ transform: translateY(-4px); opacity: 1; }}
+}}
 
 details.tool {{ background: {p['tool_bubble']}; border: 1px solid {p['border']};
   border-radius: 9px; padding: 6px 10px; font-size: .82em;
@@ -576,7 +623,7 @@ details.tool pre {{ margin: 6px 0 0 0; white-space: pre-wrap;
   background: {p['card_alt']}; transform: translateY(-1px); }}
 .welcome-chips button:active {{ transform: translateY(0); }}
 @media (prefers-reduced-motion: reduce) {{
-  .msg.enter, .welcome {{ animation: none; }}
+  .msg.enter, .welcome, .typing i, .cursor {{ animation: none; }}
   .welcome-chips button, .bubble {{ transition: none; }}
 }}
 

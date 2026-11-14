@@ -19,7 +19,7 @@ def test_read_file_rejects_path_outside_allowed_folders(tmp_path):
         "allowed_folders": [str(allowed)],
     }}
     with patch.object(tools, "load", return_value=config):
-        assert "outside the configured allowed folders" in tools.read_file(str(denied))
+        assert "outside the allowed folders" in tools.read_file(str(denied))
 
 
 def test_read_file_allows_configured_folder(tmp_path):
@@ -32,7 +32,94 @@ def test_read_file_allows_configured_folder(tmp_path):
         "allowed_folders": [str(allowed)],
     }}
     with patch.object(tools, "load", return_value=config):
-        assert tools.read_file(str(text_file)) == "hello"
+        assert tools.read_file(str(text_file)).endswith("hello")
+
+
+@pytest.fixture()
+def workspace_project(tmp_path, monkeypatch):
+    from himari.development import workspace
+
+    root = tmp_path / "workspace"
+    root.mkdir()
+    project = root / "webapp"
+    project.mkdir()
+    (project / "src").mkdir()
+    (project / "src" / "app.py").write_text("def greet():\n    return 'hi'\n", encoding="utf-8")
+    monkeypatch.setattr(tools, "load", lambda: {"permissions": {"allow_read_file": True, "allowed_folders": []}})
+    monkeypatch.setattr(workspace, "load_config", lambda: {"development": {"workspaces": [str(root)]}})
+    workspace.set_active_project(project)
+    yield project
+    workspace.set_active_project(None)
+
+
+def test_read_file_resolves_relative_paths_inside_the_open_project(workspace_project):
+    assert "return 'hi'" in tools.read_file("src/app.py")
+    assert "return 'hi'" in tools.read_file(str(workspace_project / "src" / "app.py"))
+
+
+def test_read_file_refuses_relative_paths_without_an_open_project(workspace_project):
+    from himari.development import workspace
+
+    workspace.set_active_project(None)
+
+    assert "Open a project first" in tools.read_file("src/app.py")
+
+
+def test_search_code_finds_matches_in_the_open_project(workspace_project):
+    result = tools.search_code(query="greet")
+
+    assert "src/app.py:1" in result
+    assert "def greet()" in result
+    assert "No matches" in tools.search_code(query="nothing-here")
+
+
+def test_search_code_requires_a_query_and_an_open_project(workspace_project):
+    from himari.development import workspace
+
+    assert "Tell me what text" in tools.search_code(query="  ")
+    workspace.set_active_project(None)
+    assert "No project is open yet" in tools.search_code(query="greet")
+    assert "No project is open yet" in tools.search_code(query="greet", path="")
+
+
+def test_search_code_is_registered_with_confirmation():
+    entry = next(item for item in tools.TOOLS if item["name"] == "search_code")
+
+    assert entry["confirm"] is True
+    assert entry["fn"] is tools.search_code
+    assert entry["spec"]["function"]["parameters"]["properties"]["query"]["type"] == "string"
+
+
+def test_scan_large_files_reports_real_sizes_without_touching_anything(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "big.bin").write_bytes(b"x" * 2048)
+    videos = tmp_path / "videos"
+    videos.mkdir()
+    (videos / "clip.mp4").write_bytes(b"x" * 4096)
+    (tmp_path / "tiny.txt").write_text("hi", encoding="utf-8")
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+    monkeypatch.setattr(tools, "_file_path", lambda path, **kwargs: tools.Path(path))
+
+    result = tools.scan_large_files(str(tmp_path), limit=5)
+
+    assert "Largest items in" in result
+    assert "clip.mp4" in result
+    assert "4.0 KB" in result
+    assert "big.bin" in result
+    assert "Nothing was deleted" in result
+    assert (videos / "clip.mp4").exists()
+
+
+def test_scan_large_files_stays_inside_allowed_folders(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "_perm", lambda name: True)
+
+    def deny(path, **kwargs):
+        raise PermissionError("outside")
+
+    monkeypatch.setattr(tools, "_file_path", deny)
+
+    assert "allowed folders and your configured project workspaces" in tools.scan_large_files(str(tmp_path))
 
 
 def test_read_file_rejects_symlink_escape(tmp_path):
@@ -54,7 +141,7 @@ def test_read_file_rejects_symlink_escape(tmp_path):
         "allowed_folders": [str(allowed)],
     }}
     with patch.object(tools, "load", return_value=config):
-        assert "outside the configured allowed folders" in tools.read_file(str(inside_link / "secret.txt"))
+        assert "outside the allowed folders" in tools.read_file(str(inside_link / "secret.txt"))
 
 
 def test_write_file_stays_inside_allowed_folders(tmp_path):
@@ -327,13 +414,48 @@ def test_launch_game_uses_exact_steam_title():
     open_protocol.assert_called_once_with("steam://rungameid/413150")
 
 
-def test_spotify_search_does_not_claim_playback():
-    with patch.object(tools, "_perm", return_value=True), \
-         patch.object(tools, "_open_protocol", return_value=False), \
-         patch.object(tools.webbrowser, "open", return_value=True) as open_browser:
-        result = tools.play_music("A song & artist")
-    assert "select a result" in result.lower()
-    open_browser.assert_called_once_with("https://open.spotify.com/search/A%20song%20%26%20artist")
+def test_play_music_reports_only_verified_playback(monkeypatch):
+    from himari.applications import spotify
+
+    calls = {}
+
+    def fake_play(query, artist=None):
+        calls["query"] = query
+        calls["artist"] = artist
+        return {
+            "ok": True,
+            "verified": True,
+            "query": query,
+            "artist": artist,
+            "now_playing": {"title": "Song", "artist": artist or ""},
+            "method": "deep_link+media_session",
+        }
+
+    monkeypatch.setattr(tools, "_perm", lambda key: True)
+    monkeypatch.setattr(spotify, "play", fake_play)
+
+    result = tools.play_music("A song & artist")
+
+    assert result["ok"] is True
+    assert result["verified"] is True
+    assert calls == {"query": "A song & artist", "artist": None}
+
+
+def test_play_music_surfaces_spotify_failures(monkeypatch):
+    from himari.applications import spotify
+
+    monkeypatch.setattr(tools, "_perm", lambda key: True)
+
+    def fail(query, artist=None):
+        raise spotify.SpotifyError("Spotify is not installed.")
+
+    monkeypatch.setattr(spotify, "play", fail)
+
+    result = tools.play_music("Song")
+
+    assert result["ok"] is False
+    assert "not installed" in result["error"]
+    assert tools.play_music("  ")["ok"] is False
 
 
 def test_web_search_encodes_query():

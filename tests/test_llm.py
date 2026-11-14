@@ -4,7 +4,14 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from himari.llm import LLM, LLMCancelled, LLMError, MAX_START_RETRIES, MAX_TOOL_ROUNDS
+from himari.llm import (
+    LLM,
+    LLMCancelled,
+    LLMError,
+    MAX_START_RETRIES,
+    MAX_TOOL_ROUNDS,
+    strip_reasoning,
+)
 from himari.security import Decision, RiskLevel
 
 
@@ -25,6 +32,48 @@ def test_stream_chat_disables_hidden_qwen_thinking_output():
     with patch.object(llm, "client", return_value=client):
         assert llm.stream_chat([]) == "Hello."
     assert client.chat.call_args.kwargs["think"] is False
+
+
+def test_leaked_reasoning_tags_never_reach_the_reply_or_tokens():
+    client = Mock()
+    client.chat.return_value = iter([
+        _chunk("<thi"),
+        _chunk("nk>\n\nsecret reasoning\n</think>"),
+        _chunk("Hi there."),
+    ])
+    llm = LLM()
+    tokens = []
+    with patch.object(llm, "client", return_value=client):
+        assert llm.stream_chat([], on_token=tokens.append) == "Hi there."
+    assert "".join(tokens) == "Hi there."
+    assert "secret reasoning" not in "".join(tokens)
+
+
+def test_reasoning_only_reply_is_retried_without_deep_thinking():
+    client = Mock()
+    client.chat.side_effect = [
+        iter([_chunk("<think>\n\n</think>")]),
+        iter([_chunk("Hello!")]),
+    ]
+    llm = LLM()
+    messages = [
+        {"role": "system", "content": "System rules."},
+        {"role": "user", "content": "Hi"},
+    ]
+
+    with patch.object(llm, "client", return_value=client), \
+         patch("himari.llm.time.sleep"):
+        result = llm.stream_chat(messages, think=True)
+
+    assert result == "Hello!"
+    assert client.chat.call_args_list[1].kwargs["think"] is False
+
+
+def test_strip_reasoning_removes_empty_and_inline_thinking_blocks():
+    assert strip_reasoning("<think>\n\n</think>") == ""
+    assert strip_reasoning("Hello <think>hidden</think>there!") == "Hello there!"
+    assert strip_reasoning("</think>") == ""
+    assert strip_reasoning("Plain reply.") == "Plain reply."
 
 
 def test_stream_chat_can_think_deeply_when_asked():

@@ -365,6 +365,7 @@ class TTS:
         self._on_error=on_error; self._on_finished=on_finished
         self._windows_process=None
         self._windows_process_lock=threading.Lock()
+        self.speaking=False
 
     def available_voices(self):
         user_voices = APP_DIR / "voices"
@@ -508,6 +509,7 @@ class TTS:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         wav=APP_DIR/f"tts_out_{threading.get_ident()}.wav"
         failed=False
+        self.speaking=True
         try:
             for language, spoken in self._speech_segments(text):
                 if stop_event.is_set(): return
@@ -540,6 +542,7 @@ class TTS:
             log.exception("Text-to-speech failed")
             self._report_error(str(e))
         finally:
+            self.speaking=False
             try: wav.unlink(missing_ok=True)
             except OSError: log.warning("Could not remove temporary speech file: %s",wav)
             if not failed and self._stop is stop_event and self._on_finished:
@@ -575,6 +578,7 @@ class TTS:
             sd.wait()
     def stop(self):
         self._stop.set()
+        self.speaking=False
         with self._windows_process_lock:
             process = self._windows_process
         if process is not None and process.poll() is None:
@@ -584,6 +588,7 @@ class TTS:
 class Mic:
     def __init__(self, on_silence=None):
         self.rec=False; self.buf=[]; self.stream=None
+        self.level=0.0
         self._lock = threading.Lock()
         self._silence_samples = 0
         self._silence_notified = False
@@ -604,6 +609,7 @@ class Mic:
             self._silence_samples = 0
             self._silence_notified = False
             self._speech_started = False
+            self.level = 0.0
             self.rec = True
         stream = None
         try:
@@ -637,6 +643,7 @@ class Mic:
                 return
             self.buf.append(samples.copy())
             rms = float(np.sqrt(np.mean(np.square(samples)))) if samples.size else 0.0
+            self.level = min(1.0, 0.55 * self.level + 0.45 * min(1.0, rms * 9.0))
             if rms >= self._silence_threshold:
                 self._speech_started = True
                 self._silence_samples = 0
@@ -656,6 +663,7 @@ class Mic:
             if not self.rec:
                 return np.zeros(0, dtype=np.float32)
             self.rec = False
+            self.level = 0.0
             stream = self.stream
             self.stream = None
         if stream is not None:

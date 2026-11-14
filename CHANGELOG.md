@@ -1,7 +1,108 @@
 # Changelog
 
+## Himari 5.0 (2026-11-14)
+
+- Companion skills, setup coaching and read-only diagnosis (2026-11-14):
+  - New modular `himari/skills/` package so companion features live in focused modules instead
+    of a growing `tools.py`; `skill_tools()` registers them at import time (69 tools total, no
+    duplicate names).
+  - **Watch companion** (`watch` skill): an opt-in, bounded session that takes one short look at
+    the active window every 20 s (configurable), shows a visible pink indicator in the sidebar,
+    ends automatically after 30 minutes, and keeps observations in memory only. It re-checks the
+    active-window permission on every tick, detects known games from process/window names, and
+    stores nothing on disk. Stop is available from the sidebar, the Companion screen and chat.
+  - **Setup Coach** (Companion screen): step-by-step guides for Spotify credentials, VS Code
+    pairing, voice and TTS, Ollama models, browser tools and the watch companion, plus a Verify
+    button that checks the real settings in the background. Secrets stay masked — only whether a
+    value is present is reported, never the value itself.
+  - **System Doctor** (Diagnostics screen): read-only checks of the system and of a named
+    program (Ollama status, disk space, recent Windows events, app and process state) with
+    event-log redaction. It refuses to change services, registry values, startup entries or
+    security settings.
+  - **VS Code pair programmer** (`pair` skill): reads the files and folder open in VS Code from
+    read-only workspace state behind a new `allow_vscode_state` opt-in permission, with a window
+    title fallback when the state files are unavailable. Proposals show a diff first, edits still
+    require approval, and only allowlisted test commands run.
+  - **Media companion** (`youtube_transcript`): fetches the public caption track for a YouTube
+    URL or ID and returns a bounded, timestamped transcript. Nothing is downloaded, saved or
+    played, and it requires the existing web-research permission.
+  - **Memory continuity**: a new `activity` memory category (weight 0.85) plus
+    `remember_activity` and `project_context` tools, so she can recall what you were working on.
+    Intent routing gained a `continuity` category, and the environment brief now includes the
+    active VS Code file and any running watch session.
+  - Chat confirmations for `apply_change` / `propose_change` preview the filename, character
+    count and first 500 characters instead of dumping the whole file, and the previously
+    unregistered `open_project` tool now has its risk, permission and confirmation entries.
+  - Full suite: **777 passed, 1 skipped**; offscreen construction of the whole window with all
+    eight screens, the watch indicator and both new cards verified.
+  - Packaged portable build produced on 2026-11-14: `release\Himari.exe` (610,123,837 bytes,
+    SHA-256 `1065C74D9F0F25FF67DBE05D72728FEA8E45616DF8090C76F82C51E6A65594F1`), bundling
+    `base.en` and `en_US-amy-medium`; the packaged `--self-test --gui` smoke test passed and the
+    source ZIP was refreshed as `release\Himari-source-4.0.zip`. The previous executable is kept
+    as `release\Himari-previous-build-2026-11-14-1222.exe`.
+
 ## Himari 4.0 development
 
+- Living companion redesign (2026-11-13):
+  - A persistent glass navigation sidebar now carries every screen (Chat, Companion,
+    Dashboard, Tasks, Activity, Memory, Settings, Diagnostics), so the duplicate tab strip is
+    gone and no page is unreachable. The sidebar keeps the live status chip, recent chats and
+    local-privacy note.
+  - New **Companion** screen with a large avatar stage, live state chip, mood line and a second
+    voice waveform, plus Talk, Capture screen, Float avatar and Back to chat actions.
+  - One avatar state machine now drives the hero card, sidebar dot, Companion screen and the
+    floating window from real events: microphone recording → Listening, generation → Thinking,
+    web research → Searching, agent work → Working, TTS playback → Speaking, finished work →
+    Happy, failures → Confused, and idle → Idle. No state is decorative.
+  - Both waveforms read the real microphone level and TTS flag. Starting push-to-talk
+    interrupts speech, and Stop voice only stops playback instead of closing the chat.
+  - Assistant messages carry a small Himari avatar badge and an animated typing indicator while
+    streaming; user and assistant bubbles are visually distinct with timestamps.
+  - Animated ambient background (sakura petals and light motes), aurora dividers, glass cards
+    and accent gradients across every screen, with reduced-motion support.
+  - The floating avatar shows its live state in a glass pill and returns to the main window
+    when clicked.
+  - Dashboard/Tasks/Activity/Memory/Settings/Diagnostics were rebuilt on the same page shell;
+    activity entries with an empty result no longer leave a blank second line.
+  - Avatar states without dedicated art (currently Searching) reuse the closest Himari sprite
+    with their own accent colour instead of showing the "art not installed" placeholder.
+  - Fixed a shutdown crash where a pending Settings autosave read a Qt widget that had already
+    been destroyed; Settings saves now stop cleanly during teardown. The QtWebEngine view is
+    released before exit — including in the packaged self-test — so the one-file build no
+    longer warns about `_MEI` cleanup.
+  - Full suite: **749 passed, 1 skipped**; real-GUI construction, tab navigation and exit
+    verified, and the 610 MB packaged EXE passed `--self-test --gui` with a clean exit.
+- Real actions and clean replies (2026-11-13):
+  - Leaked reasoning tags (`<think>…</think>`) are filtered out of the streamed reply. A reply
+    that contains only hidden reasoning is retried once with deep thinking disabled instead of
+    showing an empty thinking bubble.
+  - New `open_video` tool searches YouTube and opens exactly one watch page (the first by
+    default) in the signed-in default browser. Video requests receive a deterministic
+    "VIDEO REQUEST" instruction, information intents now include `open_video`,
+    `open_first_result`, and `open_url`, and the prompt forbids promising an action without
+    calling its tool in the same turn.
+  - New read-only `scan_large_files` tool reports the largest files and subfolder totals inside
+    Downloads, Documents, or another allowed folder. It never deletes, moves, or opens anything
+    and uses the existing file-read permission plus one confirmation per session.
+  - Date, weekday, and time questions are answered from the local clock instead of starting a
+    web lookup.
+  - Schema requests that mention a "picture" or "image" still force a rendered Mermaid diagram.
+- Cozy personality and faster chat (2026-11-13):
+  - Rewrote the core prompt to lead with Himari's warm, cozy, playful voice instead of
+    compliance rules. High playfulness and moderate roleplay are now the defaults, so she
+    greets and chats like a close friend while technical work stays precise.
+  - Stable general knowledge now answers directly. Automatic web research is limited to
+    explicit search requests, verification, and time-sensitive topics (news, prices,
+    weather, releases, scores, current office holders), which removes the web wait from
+    ordinary questions.
+  - Deep reasoning is now reserved for explicit planning, debugging, and long multi-step
+    requests instead of triggering on "why", "how", app actions, or every researched
+    answer. Images no longer force a reasoning pass. Replies arrive noticeably sooner.
+  - Explicit "remember that …" requests are saved immediately (sensitive and short-lived
+    facts are still refused) instead of waiting for manual approval, and each turn now
+    includes a few recent memories alongside relevant ones so she remembers you naturally.
+    Older explicit requests stored as pending suggestions are upgraded automatically.
+  - Formulas, tables, and Mermaid diagrams are unchanged and still rendered locally.
 - Desktop polish and personal shortcuts (2026-11-12):
   - Added `himari/ui_effects.py`: window fade, tab-page fade, message pulse and animated
     collapsible Settings cards. Chat messages now fade/slide in with a stagger, the welcome screen

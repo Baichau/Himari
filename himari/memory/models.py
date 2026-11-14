@@ -9,6 +9,7 @@ CATEGORIES = (
     "decisions",
     "workflows",
     "conversation_summaries",
+    "activity",
 )
 
 

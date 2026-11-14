@@ -230,6 +230,27 @@ def _build_screen(ui, cfg, section):
     )
     section.addWidget(ui.cb_active_window)
 
+    ui.watch_interval = QSpinBox()
+    ui.watch_interval.setRange(10, 60)
+    ui.watch_interval.setSingleStep(5)
+    ui.watch_interval.setSuffix(" s")
+    ui.watch_interval.setValue(_int_value(screen.get("watch_interval_seconds"), 20))
+    ui.watch_interval.setToolTip(
+        "How often a watch session takes one local look at the screen. "
+        "The shortest interval is 10 seconds."
+    )
+    ui.watch_cap = QSpinBox()
+    ui.watch_cap.setRange(1, 30)
+    ui.watch_cap.setSuffix(" min")
+    ui.watch_cap.setValue(_int_value(screen.get("watch_max_minutes"), 30))
+    ui.watch_cap.setToolTip(
+        "A watch session always stops itself after this many minutes."
+    )
+    section.addWidget(QLabel("Watch session interval:"))
+    section.addWidget(ui.watch_interval)
+    section.addWidget(QLabel("Maximum watch session length:"))
+    section.addWidget(ui.watch_cap)
+
     ui.cb_screen_control = QCheckBox(
         "Allow screen control (click, type and press keys in open apps)"
     )
@@ -321,6 +342,45 @@ def _build_permissions(ui, cfg, section):
         "Allow Windows media controls (may affect the active media app)"
     )
     ui.cb_media.setChecked(bool(permissions.get("allow_media_control", False)))
+    ui.cb_watch_mode = QCheckBox(
+        "Allow the watch companion (periodic screen looks during a watch session)"
+    )
+    ui.cb_watch_mode.setChecked(bool(permissions.get("allow_watch_mode", False)))
+    ui.cb_watch_mode.setToolTip(
+        "Lets you start an explicit watch session that takes one local look every "
+        "few seconds while a visible indicator is shown. Sessions stop themselves "
+        "after the configured limit, screenshots are discarded immediately, and "
+        "nothing is saved. Disabled by default."
+    )
+    ui.cb_diagnostics = QCheckBox(
+        "Allow read-only system diagnostics (System Doctor)"
+    )
+    ui.cb_diagnostics.setChecked(
+        bool(permissions.get("allow_system_diagnostics", False))
+    )
+    ui.cb_diagnostics.setToolTip(
+        "Lets Himari read hardware, process and Windows event-log facts to explain "
+        "slowdowns and crashes. The System Doctor never changes services, the "
+        "registry, startup items or security settings."
+    )
+    ui.cb_vscode_state = QCheckBox(
+        "Allow reading VS Code's local editor state (open files)"
+    )
+    ui.cb_vscode_state.setChecked(bool(permissions.get("allow_vscode_state", False)))
+    ui.cb_vscode_state.setToolTip(
+        "Reads the local VS Code workspace state so Himari knows which file is "
+        "actually open. It is read-only, skips sensitive files, and never reads "
+        "your settings, tokens or extensions."
+    )
+    ui.cb_run_tests = QCheckBox(
+        "Allow running project tests (allowlisted commands, asks each time)"
+    )
+    ui.cb_run_tests.setChecked(bool(permissions.get("allow_run_tests", False)))
+    ui.cb_run_tests.setToolTip(
+        "Lets Himari run a validated test command such as 'python -m pytest -q' "
+        "inside a configured development workspace. Every run asks for "
+        "confirmation and has a timeout."
+    )
 
     for widget in (
         ui.cb_apps,
@@ -330,6 +390,10 @@ def _build_permissions(ui, cfg, section):
         ui.cb_vision,
         ui.cb_browser,
         ui.cb_media,
+        ui.cb_watch_mode,
+        ui.cb_diagnostics,
+        ui.cb_vscode_state,
+        ui.cb_run_tests,
     ):
         section.addWidget(widget)
     section.addHint(
@@ -350,6 +414,101 @@ def _build_permissions(ui, cfg, section):
     section.addWidget(QLabel("Folders available to file tools:"))
     section.addWidget(ui.allowed_folders)
     section.addLayout(_row(add_folder, remove_folder, None))
+
+
+def _int_value(value, fallback):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _build_services(ui, cfg, section):
+    spotify = cfg.get("spotify", {}) or {}
+    location = cfg.get("location", {}) or {}
+    reasoning = cfg.get("reasoning", {}) or {}
+    calendar = cfg.get("calendar", {}) or {}
+    section.addHint(
+        "Himari plays exact Spotify tracks and verifies playback. To choose "
+        "between remixes and covers, it needs credentials from your own Spotify "
+        "developer app (developer.spotify.com). They stay in your local config "
+        "file and are never logged."
+    )
+    ui.spotify_client_id = QLineEdit(str(spotify.get("client_id") or ""))
+    ui.spotify_client_id.setPlaceholderText("Spotify Client ID")
+    ui.spotify_secret = QLineEdit(str(spotify.get("client_secret") or ""))
+    ui.spotify_secret.setEchoMode(QLineEdit.EchoMode.Password)
+    ui.spotify_secret.setPlaceholderText("Spotify Client Secret")
+    ui.spotify_secret.setToolTip(
+        "Stored locally in config.json and used only to request a read-only "
+        "Spotify search token. It is never written to logs or chat."
+    )
+    section.addWidget(QLabel("Spotify Client ID:"))
+    section.addWidget(ui.spotify_client_id)
+    section.addWidget(QLabel("Spotify Client Secret:"))
+    section.addWidget(ui.spotify_secret)
+    section.addHint(
+        "Without credentials Himari still asks Spotify to play the song, but it "
+        "cannot pick the exact track for you."
+    )
+
+    ui.weather_city = QLineEdit(str(location.get("city") or ""))
+    ui.weather_city.setPlaceholderText("e.g. Tashkent")
+    section.addWidget(QLabel("Weather city (empty = detect automatically):"))
+    section.addWidget(ui.weather_city)
+    ui.weather_units = QComboBox()
+    ui.weather_units.addItem("Celsius (metric)", "metric")
+    ui.weather_units.addItem("Fahrenheit (imperial)", "imperial")
+    units = str(location.get("units") or "metric").casefold()
+    ui.weather_units.setCurrentIndex(
+        max(0, ui.weather_units.findData(units))
+    )
+    section.addWidget(QLabel("Temperature units:"))
+    section.addWidget(ui.weather_units)
+    ui.cb_weather_auto = QCheckBox(
+        "Detect my city from the network when none is set"
+    )
+    ui.cb_weather_auto.setChecked(bool(location.get("auto_detect", True)))
+    section.addWidget(ui.cb_weather_auto)
+
+    ui.reasoning_profile = QComboBox()
+    for label, value in (
+        ("Automatic (recommended)", "auto"),
+        ("Direct — quick single answers", "direct"),
+        ("Guided — plan multi-step work", "guided"),
+        ("Deep — long, open-ended work", "deep"),
+    ):
+        ui.reasoning_profile.addItem(label, value)
+    profile = str(reasoning.get("profile") or "auto").casefold()
+    ui.reasoning_profile.setCurrentIndex(
+        max(0, ui.reasoning_profile.findData(profile))
+    )
+    section.addWidget(QLabel("Task reasoning level:"))
+    section.addWidget(ui.reasoning_profile)
+    ui.cb_auto_escalate = QCheckBox(
+        "Raise the reasoning level automatically after a failed step"
+    )
+    ui.cb_auto_escalate.setChecked(bool(reasoning.get("auto_escalate", True)))
+    section.addWidget(ui.cb_auto_escalate)
+    ui.reasoning_rounds = QSpinBox()
+    ui.reasoning_rounds.setRange(1, 30)
+    ui.reasoning_rounds.setValue(_int_value(reasoning.get("max_rounds"), 12))
+    ui.reasoning_rounds.setToolTip(
+        "How many tool rounds one task may use. Higher values allow longer "
+        "tasks but take more time."
+    )
+    section.addWidget(QLabel("Maximum tool rounds per task:"))
+    section.addWidget(ui.reasoning_rounds)
+
+    ui.calendar_duration = QSpinBox()
+    ui.calendar_duration.setRange(5, 1440)
+    ui.calendar_duration.setSingleStep(15)
+    ui.calendar_duration.setSuffix(" min")
+    ui.calendar_duration.setValue(
+        _int_value(calendar.get("default_duration_minutes"), 60)
+    )
+    section.addWidget(QLabel("Calendar default event length:"))
+    section.addWidget(ui.calendar_duration)
 
 
 def _build_advanced(ui, cfg, section):
@@ -502,6 +661,7 @@ def build_settings_page(ui):
     _build_screen(ui, cfg, _section(layout, "Screen & shortcuts", True))
     _build_privacy(ui, cfg, _section(layout, "Privacy & memory", True))
     _build_permissions(ui, cfg, _section(layout, "Permissions", False))
+    _build_services(ui, cfg, _section(layout, "Assistant & services", True))
     _build_advanced(ui, cfg, _section(layout, "Advanced", False))
     _build_window_and_data(ui, cfg, _section(layout, "Window & data", False))
     layout.addStretch()

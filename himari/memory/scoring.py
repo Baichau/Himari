@@ -27,6 +27,7 @@ CATEGORY_WEIGHTS = {
     "decisions": 1.05,
     "workflows": 1.0,
     "conversation_summaries": 0.9,
+    "activity": 0.85,
 }
 
 

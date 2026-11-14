@@ -39,6 +39,9 @@ class ToolRegistry:
     def names(self):
         return sorted(self._tools)
 
+    def entries(self):
+        return [self._tools[name] for name in sorted(self._tools)]
+
     def specs(self):
         return [entry["spec"] for entry in self._tools.values() if entry.get("spec")]
 

@@ -140,6 +140,10 @@ def self_test(open_gui=False, require_ollama=False):
 
             QTimer.singleShot(1500, close_test_window)
             app.exec()
+            try:
+                window.shutdown_web_engine()
+            except Exception:
+                log.debug("Packaged smoke cleanup failed", exc_info=True)
             log.info("Packaged main-window smoke test completed.")
     except Exception as exc:
         message = f"Packaged runtime self-test failed: {exc}"

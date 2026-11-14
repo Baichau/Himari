@@ -1,6 +1,6 @@
 # Himari 4 — Upgrade Roadmap
 
-Status as of 2026-11-12. This file is the running record of completed and remaining work.
+Status as of 2026-11-13. This file is the running record of completed and remaining work.
 The staging order follows the upgrade brief, with one deliberate reordering: **context and reasoning
 correctness first**, because every later feature depends on the model actually receiving the tools,
 history, and instructions it is given.
@@ -460,6 +460,130 @@ step and needs the running app closed first.
   - Offscreen construction of the real window: 6 tabs, 6 Settings sections, shortcut labels, screen
     area defaults, section expansion and welcome-chip fill all exercised without errors.
   - Full suite: **623 passed, 1 skipped**.
+
+## Stage 12 — Outcome-driven agent and daily-use core (completed 2026-11-13)
+
+Goal: turn comprehension → planning → execution → verification → honest reporting into the one path
+that both chat and tasks use, and make the three daily-use integrations real.
+
+- [x] Understanding layer (`himari/core/`)
+  - Rules-first `Intent` extraction (category, goal, entities, expected outcome, confidence), optional
+    model merge that may only refine a rules result, and validation of merged output.
+  - `capabilities.py` registry: tags, risk/permission metadata, 30 s availability TTL, required vs
+    optional filtering, and a 16-tool ceiling per request.
+  - `context.py` environment brief (OS, desktop, available helpers) appended as guidance, not as
+    user instructions.
+  - `reasoning.py` profiles — direct (3 rounds / 3 steps), guided (8 / 8, one replan), deep
+    (16 / 20, two replans) — with automatic escalation; the model still cannot raise its own budget.
+- [x] Outcome-driven execution (`himari/agent/`)
+  - `AgentOrchestrator` runs plan mode (validated DAG, one ready step per round, skips dependents of
+    blocked steps) or step mode (one next action per round); chat and tasks select tools through the
+    same capability registry (`tools_for_intent`) and share schema validation and result
+    classification, while tasks add planning, per-tool verification, recovery and persisted state.
+  - `Executor` pipeline: known tool → schema validation → authorization → handler with timeout →
+    failure classification, with per-tool verification and an objective check before a task can be
+    reported complete.
+  - Conservative recovery (`recovery.py`): permission stops, invalid replans, unavailable uses a
+    working alternative, a timed-out or unverified *mutating* action is never retried automatically,
+    and unclear failures ask the user.
+  - `TaskRecord` lifecycle persisted to SQLite; blocked tools, replan counters and cancellation are
+    enforced rather than described.
+- [x] Real daily-use integrations
+  - Spotify: Client Credentials token (client ID/secret from Settings only), search and ranking,
+    `spotify:track:` deep link, playback confirmation by polling the Windows media session for 18 s,
+    UIA fallback, and an explicit `verified` flag instead of an assumed success.
+  - Weather: Open-Meteo with geocoding and IP fallback, WMO descriptions, 10-minute cache, structured
+    location in the result so failures can be reported honestly.
+  - Calendar: local SQLite events, natural-language parsing, confirmation-gated create/delete, and
+    `.ics` export whose success is verified on disk.
+- [x] UI and Settings
+  - Tasks tab (create, watch, cancel) and Activity tab over the real action log; Settings gained the
+    services section for Spotify credentials and calendar options.
+- [x] Documentation
+  - [ARCHITECTURE.md](ARCHITECTURE.md) rewritten for the current runtime, plus
+    [AGENT_DESIGN.md](AGENT_DESIGN.md), [EXECUTION_ENGINE.md](EXECUTION_ENGINE.md),
+    [TOOL_SCHEMAS.md](TOOL_SCHEMAS.md), [APP_DISCOVERY.md](APP_DISCOVERY.md),
+    [FAILURE_RECOVERY.md](FAILURE_RECOVERY.md) and [SECURITY_MODEL.md](SECURITY_MODEL.md).
+- [x] Verification
+  - `compileall` OK; full suite **709 passed, 1 skipped**.
+  - Tests cover intent extraction, capability selection, reasoning budgets, plan validation,
+    executor failure classification, recovery decisions, verification (including weather structure
+    and calendar export on disk), Spotify ranking, weather parsing and calendar round-trips.
+  - Follow-up fixes on 2026-11-13: long restored transcripts no longer animate through a huge smooth
+    scroll, which left the embedded view unpainted and looked like missing text; the view now jumps
+    instantly for long distances, stays pinned to the bottom as late content grows, and unpins when
+    you scroll up. Ordinary open/watch/play requests are structurally routed to the user's signed-in
+    default browser: `browser_*` tools are removed from intent tool lists unless the request explicitly
+    names Himari's browser or its tabs, with regression tests for both paths. The Tasks table now uses
+    the app theme, a styled header and status colors instead of the default gray grid.
+  - Packaged portable build produced on 2026-11-13: `release\Himari.exe` (610,009,595 bytes,
+    SHA-256 `613D4FE439C2C3809AE53E39008818F4D06DBBCE7C393B1BB1351D388C60BD19`), bundling `base.en`
+    and `en_US-amy-medium`; the packaged `--self-test --gui` smoke test passed, and a packaged
+    launch with a seeded 32-message transcript showed the complete tail with code and table blocks
+    after restoration. The pre-fix executable is archived as
+    `release\Himari-previous-build-2026-11-13-1320.exe`.
+
+Remaining after this stage:
+
+- Calendar reminders (no scheduler runs yet) and editing an already-created event.
+- More apps at the *inspectable/controllable* support level; most discovered apps are still
+  launch-only, which the UI states rather than hides.
+- A multilingual speech model is not bundled; rebuild with one prepared locally if Russian
+  recognition is required.
+
+## Stage 13 — Companion skills: watch, coaching, diagnosis and continuity (completed 2026-11-14)
+
+Goal: make Himari feel like a companion who can help with almost anything on the machine without
+widening the security boundary. Everything new lives in `himari/skills/` and is merged into the
+existing registry, so risk checks, confirmations and audit logging keep applying.
+
+- [x] `skills/` package with lazy tool aggregation (`skill_tools()`), imported at the end of
+      `tools.py`; 69 registered tools, no duplicate names.
+- [x] Watch companion — periodic, opt-in, visible, bounded
+  - One short look at the active window every 20 s (Settings), a pink sidebar indicator, and an
+    automatic stop after 30 minutes.
+  - Observations live only in memory; the active-window permission is re-checked on every tick
+    and the session ends if it is revoked. Known games are detected from process/window names.
+  - UI: sidebar card with a live countdown and Stop, plus Companion-screen start/stop and status.
+- [x] Setup Coach — interactive onboarding
+  - Playbooks for Spotify credentials, VS Code pairing, voice/TTS, Ollama models, browser tools
+    and the watch companion, with an aliases resolver and numbered steps.
+  - `inspect_settings` / `setup_verify` report only whether a secret is configured, never its
+    value; verification runs in a background thread.
+- [x] System Doctor — read-only diagnosis
+  - `inspect_system` and `diagnose_program` cover Ollama, disk, memory, GPU, battery, top
+    processes and recent Windows event entries, with redaction.
+  - Refuses to modify services, registry values, startup entries or security settings.
+- [x] VS Code pair programmer
+  - Reads open editors and the workspace from read-only `workspaceStorage` state behind the new
+    `allow_vscode_state` permission, with a window-title fallback.
+  - `propose_change` shows a diff, `apply_change` still needs confirmation, and `run_tests`
+    accepts only allowlisted commands.
+- [x] Media companion
+  - `youtube_transcript` resolves a watch URL or ID, fetches public captions and returns a
+    bounded, timestamped transcript. Needs the existing web-research permission; nothing is
+    downloaded, saved or played.
+- [x] Memory continuity
+  - New `activity` memory category (weight 0.85), `remember_activity` and `project_context`.
+  - Intent routing gained a `continuity` category; the environment brief now includes the active
+    VS Code file and any running watch session.
+- [x] Security and confirmation hygiene
+  - `open_project` was missing from `TOOL_RISKS`/`TOOL_PERMISSIONS`/`CONFIRMATION_TOOLS` and was
+    therefore denied by the default-deny layer; it is now registered.
+  - `apply_change`/`propose_change` confirmations show the path, size and a 500-character preview
+    instead of the whole file.
+- [x] Verification
+  - `compileall` OK; full suite **777 passed, 1 skipped**; new `tests/test_skills.py` and
+    `tests/test_ui_skills.py`, with the memory category test updated.
+  - Offscreen construction of the full window (eight screens, watch indicator, coach and doctor
+    cards) succeeded and exited cleanly.
+
+Remaining after this stage:
+
+- Watch mode gives text advice from a single look; it does not yet track progress over time or
+  suggest timed prompts.
+- Setup Coach covers six topics; more integrations can be added by extending its playbooks.
+- System Doctor reports only; it does not offer guided fixes for the problems it finds.
 
 ## Optional local backends
 

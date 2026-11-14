@@ -30,7 +30,7 @@ sequenceDiagram
     opt research route
         T->>T: DuckDuckGo Lite fetch (5 snippets)
     end
-    T->>D: history(60 msgs / 9000 chars)
+    T->>D: history(80 msgs / 12000 chars)
     T->>D: relevant memories + latest summary
     T->>P: build(system + tools + context)
     T->>L: stream_chat(messages, think)

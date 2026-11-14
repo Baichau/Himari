@@ -789,6 +789,12 @@ def _settings_window():
         cb_deep_reasoning=_Checked(True),
         cb_always_on_top=_Checked(False),
         cb_minimize_to_tray=_Checked(True),
+        cb_weather_auto=_Checked(True),
+        cb_auto_escalate=_Checked(True),
+        cb_watch_mode=_Checked(False),
+        cb_diagnostics=_Checked(True),
+        cb_vscode_state=_Checked(True),
+        cb_run_tests=_Checked(False),
         allowed_folders=_Items("C:/Docs"),
         development_workspaces=_Items("C:/Code"),
         reply_wait=_Value(900),
@@ -803,9 +809,18 @@ def _settings_window():
         vision_model_box=_Combo(text="qwen2.5vl:3b"),
         model_box=_Combo(text="qwen3:8b"),
         screen_area=_Combo(data="primary"),
+        weather_units=_Combo(data="metric"),
+        reasoning_profile=_Combo(data="auto"),
+        reasoning_rounds=_Value(12),
+        calendar_duration=_Value(60),
+        watch_interval=_Value(20),
+        watch_cap=_Value(30),
         _screen_region=None,
         ollama_host=_Text("http://127.0.0.1:11434"),
         embedding_model=_Text("nomic-embed-text"),
+        spotify_client_id=_Text("client-abc"),
+        spotify_secret=_Text("secret-xyz"),
+        weather_city=_Text("Tashkent"),
         hotkey=_Text("f9"),
         wake_word_field=_Text("Himari"),
         screen_hotkey=_Text("f10"),
@@ -832,6 +847,19 @@ def test_settings_updates_include_text_fields_for_a_full_save():
     assert updates["screen"]["monitor"] == "primary"
     assert updates["screen"]["region"] is None
     assert updates["permissions"]["allow_run_command"] is False
+    assert updates["permissions"]["allow_watch_mode"] is False
+    assert updates["permissions"]["allow_system_diagnostics"] is True
+    assert updates["permissions"]["allow_vscode_state"] is True
+    assert updates["permissions"]["allow_run_tests"] is False
+    assert updates["screen"]["watch_interval_seconds"] == 20
+    assert updates["screen"]["watch_max_minutes"] == 30
+    assert updates["spotify"]["client_id"] == "client-abc"
+    assert updates["spotify"]["client_secret"] == "secret-xyz"
+    assert updates["location"]["city"] == "Tashkent"
+    assert updates["location"]["units"] == "metric"
+    assert updates["reasoning"]["profile"] == "auto"
+    assert updates["reasoning"]["max_rounds"] == 12
+    assert updates["calendar"]["default_duration_minutes"] == 60
 
 
 def test_settings_autosave_skips_partially_typed_text_fields():
@@ -847,6 +875,11 @@ def test_settings_autosave_skips_partially_typed_text_fields():
     assert updates["screen"]["region"] is None
     assert "memory" not in updates
     assert "imagegen" not in updates
+    assert "spotify" not in updates
+    assert "city" not in updates["location"]
+    assert updates["location"]["auto_detect"] is True
+    assert updates["reasoning"]["auto_escalate"] is True
+    assert updates["calendar"]["default_duration_minutes"] == 60
     assert updates["ui"]["chat_engine"] == "web"
     assert updates["voice"]["volume"] == 0.7
     assert updates["voice"]["sensitivity"] == 0.75
@@ -902,6 +935,30 @@ def test_autosave_failure_warns_once_without_a_dialog(monkeypatch):
     assert len(statuses) == 1
 
 
+def test_settings_save_skips_reads_from_destroyed_widgets(monkeypatch):
+    calls = []
+
+    class FakeService:
+        def update(self, updates):
+            calls.append(updates)
+            return {}
+
+    def deleted(**_kwargs):
+        raise RuntimeError(
+            "Internal C++ object (PySide6.QtWidgets.QPushButton) already deleted."
+        )
+
+    monkeypatch.setattr(ui.control_settings, "SettingsService", FakeService)
+    window = SimpleNamespace(
+        _settings_updates=deleted,
+        _settings_save_warned=False,
+    )
+    window._save_settings = lambda **kwargs: UI._save_settings(window, **kwargs)
+
+    assert UI._save_settings(window, interactive=True) is False
+    assert calls == []
+
+
 def test_autosave_debounce_timer_is_started_by_widget_changes():
     started = []
     window = SimpleNamespace(
@@ -912,3 +969,48 @@ def test_autosave_debounce_timer_is_started_by_widget_changes():
     UI._schedule_settings_save(window, False)
 
     assert len(started) == 2
+
+
+def test_voice_poll_drives_both_waveforms_from_real_state():
+    modes = []
+    wave = SimpleNamespace(
+        set_mode=lambda mode: modes.append(mode),
+        set_level=lambda level: modes.append(level),
+    )
+    companion = SimpleNamespace(
+        set_mode=lambda mode: modes.append(mode),
+        set_level=lambda level: modes.append(level),
+    )
+    timers = []
+    window = SimpleNamespace(
+        voice_wave=wave,
+        companion_wave=companion,
+        mic=SimpleNamespace(rec=True, level=0.42),
+        _tts_active=False,
+        _voice_timer=SimpleNamespace(stop=lambda: timers.append("stop")),
+    )
+
+    UI._poll_voice(window)
+
+    assert modes.count("listening") == 2
+    assert 0.42 in modes
+    assert timers == []
+
+    window.mic = SimpleNamespace(rec=False, level=0.0)
+    UI._poll_voice(window)
+    assert modes.count("idle") == 2
+    assert timers == ["stop"]
+
+
+def test_finished_tts_marks_speech_inactive_and_reports_ready():
+    statuses = []
+    window = SimpleNamespace(
+        _tts_active=True,
+        busy=False,
+        status=SimpleNamespace(emit=statuses.append),
+    )
+
+    UI._on_tts_finished(window)
+
+    assert window._tts_active is False
+    assert statuses == ["Ready."]

@@ -46,7 +46,7 @@ def test_browser_tool_descriptions_state_their_limits():
     tabs_text = by_name["browser_tabs"]["spec"]["function"]["description"]
     play_text = by_name["play_music"]["spec"]["function"]["description"]
     assert "never touches the user's everyday Chrome tabs" in tabs_text
-    assert "never say the requested song is playing" in play_text
+    assert "Only report success when the result says playback was verified" in play_text
 
 
 def test_browser_open_verifies_the_real_page(monkeypatch):

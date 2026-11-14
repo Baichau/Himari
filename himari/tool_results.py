@@ -5,6 +5,8 @@ counted or presented as a success. Classification only reads the value; it
 never changes the observation the model sees.
 """
 
+import json
+
 _FAILURE_PREFIXES = (
     "denied:",
     "tool error:",
@@ -17,6 +19,16 @@ _FAILURE_PREFIXES = (
     "unable to",
     "cannot ",
 )
+
+
+def as_text(result):
+    """Render a tool result for prompts and logs without losing structure."""
+    if isinstance(result, (dict, list)):
+        try:
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            return str(result)
+    return str(result)
 
 
 def classify_result(result):
